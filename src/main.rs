@@ -270,8 +270,60 @@ struct Health {
     max: f32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum EnemyKind {
+    Grunt,
+    Heavy,
+}
+
+impl EnemyKind {
+    fn hp(self) -> f32 {
+        match self {
+            EnemyKind::Grunt => 50.0,
+            EnemyKind::Heavy => 350.0,
+        }
+    }
+    fn speed(self) -> f32 {
+        match self {
+            EnemyKind::Grunt => 2.6,
+            EnemyKind::Heavy => 1.8,
+        }
+    }
+    fn stop_dist(self) -> f32 {
+        match self {
+            EnemyKind::Grunt => 10.0,
+            EnemyKind::Heavy => 12.0,
+        }
+    }
+    fn range(self) -> f32 {
+        match self {
+            EnemyKind::Grunt => 16.0,
+            EnemyKind::Heavy => 19.0,
+        }
+    }
+    fn damage(self) -> f32 {
+        match self {
+            EnemyKind::Grunt => 7.0,
+            EnemyKind::Heavy => 15.0,
+        }
+    }
+    fn fire_interval(self) -> f32 {
+        match self {
+            EnemyKind::Grunt => 1.1,
+            EnemyKind::Heavy => 0.9,
+        }
+    }
+    fn size(self) -> f32 {
+        match self {
+            EnemyKind::Grunt => 1.0,
+            EnemyKind::Heavy => 1.7,
+        }
+    }
+}
+
 #[derive(Component)]
 struct Enemy {
+    kind: EnemyKind,
     yaw: f32,
     phase: f32,
     blend: f32,
@@ -435,24 +487,32 @@ struct Fx {
     jet: Handle<AudioSource>,
 }
 
-#[derive(Resource)]
-struct Spawner {
-    timer: f32,
-    n: u32,
+/// Wave progression. `counting` is true while waiting between waves.
+#[derive(Resource, Default)]
+struct Waves {
+    number: u32,
+    queue: Vec<EnemyKind>,
+    spawn_timer: f32,
+    spawned: u32,
+    counting: bool,
+    intermission: f32,
+    banner: f32,
 }
+
+#[derive(Component)]
+struct WaveBanner;
+
+#[derive(Component)]
+struct WaveStatus;
 
 const HERO_HP: f32 = 100.0;
 const HERO_RANGE: f32 = 15.0;
 const HERO_DAMAGE: f32 = 10.0;
 const HERO_FIRE_INTERVAL: f32 = 0.25;
-const ENEMY_HP: f32 = 50.0;
-const ENEMY_SPEED: f32 = 2.6;
-const ENEMY_STOP_DIST: f32 = 10.0;
-const ENEMY_RANGE: f32 = 16.0;
-const ENEMY_DAMAGE: f32 = 7.0;
-const ENEMY_FIRE_INTERVAL: f32 = 1.1;
-const MAX_ENEMIES: usize = 6;
-const SPAWN_INTERVAL: f32 = 3.5;
+const HERO_REGEN: f32 = 1.0; // health per second
+const WAVE_DELAY: f32 = 10.0;
+const FIRST_WAVE_DELAY: f32 = 3.0;
+const WAVE_BANNER_TIME: f32 = 3.0;
 
 #[derive(Component, Clone, Copy, PartialEq)]
 enum Limb {
@@ -514,7 +574,7 @@ fn main() {
         })
         .init_resource::<Anim>()
         .init_resource::<Powers>()
-        .insert_resource(Spawner { timer: 2.0, n: 0 })
+        .init_resource::<Waves>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -526,7 +586,7 @@ fn main() {
                 hero_move,
                 jetpack,
                 barrage,
-                enemy_spawner,
+                wave_manager,
                 enemy_ai,
                 projectiles,
                 update_flashes,
@@ -538,6 +598,7 @@ fn main() {
                 update_marker,
                 update_area_cursor,
                 update_hud,
+                update_wave_ui,
             )
                 .chain(),
         )
@@ -642,6 +703,7 @@ fn setup(
     spawn_health_bar(&mut commands, &mut meshes, &mut materials, hero, Meter::Health, 0.0, 1.6, Color::srgb(0.2, 0.9, 0.3));
     spawn_health_bar(&mut commands, &mut meshes, &mut materials, hero, Meter::Energy, 1.0, 1.6, Color::srgb(0.25, 0.55, 1.0));
     spawn_hud(&mut commands);
+    spawn_wave_ui(&mut commands);
 
     // Ring showing the barrage target area
     commands.spawn((
@@ -957,7 +1019,9 @@ fn spawn_enemy(
     materials: &mut Assets<StandardMaterial>,
     pos: Vec3,
     yaw: f32,
+    kind: EnemyKind,
 ) -> Entity {
+    let heavy = kind == EnemyKind::Heavy;
     let mut mat = |r: f32, g: f32, b: f32, metallic: f32, rough: f32| {
         materials.add(StandardMaterial {
             base_color: Color::srgb(r, g, b),
@@ -966,28 +1030,47 @@ fn spawn_enemy(
             ..default()
         })
     };
-    let tan = mat(0.76, 0.63, 0.38, 0.1, 0.55);
-    let dark = mat(0.20, 0.18, 0.17, 0.5, 0.5);
-    let blaster = mat(0.10, 0.10, 0.11, 0.7, 0.4);
+    let (tan, dark, blaster) = if heavy {
+        (
+            mat(0.34, 0.35, 0.40, 0.6, 0.4),
+            mat(0.12, 0.12, 0.13, 0.5, 0.5),
+            mat(0.08, 0.08, 0.09, 0.8, 0.35),
+        )
+    } else {
+        (
+            mat(0.76, 0.63, 0.38, 0.1, 0.55),
+            mat(0.20, 0.18, 0.17, 0.5, 0.5),
+            mat(0.10, 0.10, 0.11, 0.7, 0.4),
+        )
+    };
+    let stripe = mat(0.7, 0.08, 0.08, 0.2, 0.5);
+    let (eye_color, eye_glow) = if heavy {
+        (Color::srgb(1.0, 0.1, 0.05), LinearRgba::rgb(5.0, 0.2, 0.1))
+    } else {
+        (Color::srgb(1.0, 0.7, 0.1), LinearRgba::rgb(3.0, 1.5, 0.1))
+    };
     let eye = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.7, 0.1),
-        emissive: LinearRgba::rgb(3.0, 1.5, 0.1),
+        base_color: eye_color,
+        emissive: eye_glow,
         ..default()
     });
 
     let root = commands
         .spawn((
-            Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw)),
+            Transform::from_translation(pos)
+                .with_rotation(Quat::from_rotation_y(yaw))
+                .with_scale(Vec3::splat(kind.size())),
             Visibility::default(),
             Enemy {
+                kind,
                 yaw,
                 phase: hash(pos.x as i32, pos.z as i32, 9) * 6.0,
                 blend: 1.0,
                 cooldown: 0.5 + hash(pos.z as i32, pos.x as i32, 4),
             },
             Health {
-                cur: ENEMY_HP,
-                max: ENEMY_HP,
+                cur: kind.hp(),
+                max: kind.hp(),
             },
         ))
         .id();
@@ -1006,6 +1089,22 @@ fn spawn_enemy(
     b.part(head, Cuboid::new(0.05, 0.1, 0.12), &dark, t(0.0, 0.03, -0.1)); // back crest
     for side in [1.0, -1.0] {
         b.part(head, Sphere::new(0.025), &eye, t(0.06 * side, 0.02, 0.16));
+    }
+
+    if heavy {
+        // Armor plating: big chest, shoulder pads, red stripe, second barrel.
+        b.part(body, Cuboid::new(0.34, 0.3, 0.18), &tan, t(0.0, 0.3, 0.02));
+        b.part(body, Cuboid::new(0.1, 0.28, 0.02), &stripe, t(0.0, 0.3, 0.12));
+        for side in [1.0, -1.0] {
+            b.part(
+                body,
+                Sphere::new(0.12),
+                &tan,
+                t(0.22 * side, 0.46, 0.0).with_scale(Vec3::new(1.0, 0.8, 1.1)),
+            );
+        }
+        b.part(head, Cuboid::new(0.2, 0.05, 0.3), &tan, t(0.0, 0.11, 0.05)); // helmet plate
+        b.part(body, Cylinder::new(0.015, 0.3), &blaster, t(-0.03, 0.3, 0.8).with_rotation(Quat::from_rotation_x(FRAC_PI_2)));
     }
 
     // Blaster held out front in both hands.
@@ -1141,7 +1240,7 @@ fn issue_orders(
     let mut best: Option<(Entity, f32, Vec3)> = None;
     for (e, t) in &enemies {
         let d = Vec2::new(t.translation.x - p.x, t.translation.z - p.z).length();
-        if d < 1.6 && best.is_none_or(|(_, bd, _)| d < bd) {
+        if d < 1.6 * t.scale.x && best.is_none_or(|(_, bd, _)| d < bd) {
             best = Some((e, d, t.translation));
         }
     }
@@ -1411,21 +1510,57 @@ fn hero_move(
     }
 }
 
-fn enemy_spawner(
+fn build_wave(n: u32) -> Vec<EnemyKind> {
+    let grunts = (2 + 2 * n).min(24) as usize;
+    let heavies = if n >= 3 { (n - 2).min(8) as usize } else { 0 };
+    let mut queue = vec![EnemyKind::Grunt; grunts + heavies];
+    // Spread heavies through the wave so they arrive spaced out.
+    for k in 0..heavies {
+        let idx = (k + 1) * queue.len() / (heavies + 1);
+        queue[idx] = EnemyKind::Heavy;
+    }
+    queue
+}
+
+fn wave_manager(
     time: Res<Time>,
-    mut spawner: ResMut<Spawner>,
+    mut waves: ResMut<Waves>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     enemies: Query<(), With<Enemy>>,
 ) {
-    spawner.timer -= time.delta_secs();
-    if spawner.timer > 0.0 || enemies.iter().count() >= MAX_ENEMIES {
+    let dt = time.delta_secs();
+    waves.banner = (waves.banner - dt).max(0.0);
+
+    if waves.queue.is_empty() && enemies.is_empty() {
+        // Wave cleared (or game start): count down to the next one.
+        if !waves.counting {
+            waves.counting = true;
+            waves.intermission = if waves.number == 0 { FIRST_WAVE_DELAY } else { WAVE_DELAY };
+        }
+        waves.intermission -= dt;
+        if waves.intermission <= 0.0 {
+            waves.number += 1;
+            waves.queue = build_wave(waves.number);
+            waves.spawn_timer = 0.0;
+            waves.counting = false;
+            waves.banner = WAVE_BANNER_TIME;
+        }
         return;
     }
-    spawner.timer = SPAWN_INTERVAL;
-    let n = spawner.n as i32;
-    spawner.n += 1;
+
+    if waves.queue.is_empty() {
+        return;
+    }
+    waves.spawn_timer -= dt;
+    if waves.spawn_timer > 0.0 {
+        return;
+    }
+    let kind = waves.queue.remove(0);
+    waves.spawn_timer = if kind == EnemyKind::Heavy { 1.5 } else { 0.6 };
+    let n = waves.spawned as i32;
+    waves.spawned += 1;
 
     let e = HALF - 4.0;
     let u = (hash(n, 1, 777) * 2.0 - 1.0) * e;
@@ -1436,8 +1571,69 @@ fn enemy_spawner(
         _ => (u, -e),
     };
     let pos = Vec3::new(x, height(x, z), z);
-    let enemy = spawn_enemy(&mut commands, &mut meshes, &mut materials, pos, (-x).atan2(-z));
-    spawn_health_bar(&mut commands, &mut meshes, &mut materials, enemy, Meter::Health, 0.0, 1.2, Color::srgb(0.95, 0.2, 0.15));
+    let enemy = spawn_enemy(&mut commands, &mut meshes, &mut materials, pos, (-x).atan2(-z), kind);
+    let (width, color) = match kind {
+        EnemyKind::Grunt => (1.2, Color::srgb(0.95, 0.2, 0.15)),
+        EnemyKind::Heavy => (2.2, Color::srgb(0.85, 0.1, 0.45)),
+    };
+    spawn_health_bar(&mut commands, &mut meshes, &mut materials, enemy, Meter::Health, 0.0, width, color);
+}
+
+fn spawn_wave_ui(commands: &mut Commands) {
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(18.0),
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            row_gap: Val::Px(4.0),
+            ..default()
+        })
+        .with_children(|p| {
+            p.spawn((
+                Text::new(""),
+                TextFont { font_size: 64.0, ..default() },
+                TextColor(Color::srgba(1.0, 0.85, 0.3, 0.0)),
+                WaveBanner,
+            ));
+            p.spawn((
+                Text::new(""),
+                TextFont { font_size: 22.0, ..default() },
+                TextColor(Color::srgb(0.9, 0.92, 1.0)),
+                WaveStatus,
+            ));
+        });
+}
+
+fn update_wave_ui(
+    waves: Res<Waves>,
+    enemies: Query<(), With<Enemy>>,
+    mut banner: Query<(&mut Text, &mut TextColor), (With<WaveBanner>, Without<WaveStatus>)>,
+    mut status: Query<&mut Text, (With<WaveStatus>, Without<WaveBanner>)>,
+) {
+    if let Ok((mut text, mut color)) = banner.single_mut() {
+        if waves.banner > 0.0 {
+            text.0 = format!("WAVE {}", waves.number);
+            color.0 = Color::srgba(1.0, 0.85, 0.3, waves.banner.min(1.0));
+        } else {
+            color.0 = Color::srgba(1.0, 0.85, 0.3, 0.0);
+        }
+    }
+    if let Ok(mut text) = status.single_mut() {
+        let left = enemies.iter().count() + waves.queue.len();
+        text.0 = if waves.counting && waves.number == 0 {
+            "Get ready...".to_string()
+        } else if waves.counting {
+            format!(
+                "Wave {} cleared  -  next wave in {}",
+                waves.number,
+                waves.intermission.ceil().max(0.0) as i32
+            )
+        } else {
+            format!("Wave {}  -  {} enemies left", waves.number, left)
+        };
+    }
 }
 
 fn enemy_ai(
@@ -1453,9 +1649,11 @@ fn enemy_ai(
     };
     let dt = time.delta_secs();
     let target = hero_tf.translation;
-    let others: Vec<Vec3> = enemies.iter().map(|(t, _)| t.translation).collect();
+    let others: Vec<(Vec3, f32)> = enemies.iter().map(|(t, e)| (t.translation, e.kind.size())).collect();
 
     for (mut tf, mut e) in &mut enemies {
+        let kind = e.kind;
+        let size = kind.size();
         let to = Vec3::new(target.x - tf.translation.x, 0.0, target.z - tf.translation.z);
         let dist = to.length();
         let dir = to / dist.max(0.001);
@@ -1464,17 +1662,18 @@ fn enemy_ai(
         let diff = wrap_angle(desired - e.yaw);
         e.yaw += diff.clamp(-5.0 * dt, 5.0 * dt);
 
-        let moving = dist > ENEMY_STOP_DIST;
+        let moving = dist > kind.stop_dist();
         if moving {
-            tf.translation += dir * ENEMY_SPEED * dt;
-            e.phase += ENEMY_SPEED * 2.8 * dt;
+            tf.translation += dir * kind.speed() * dt;
+            e.phase += kind.speed() * 2.8 / size * dt;
         }
         // Don't stack on top of each other.
-        for o in &others {
+        for (o, osize) in &others {
             let away = Vec3::new(tf.translation.x - o.x, 0.0, tf.translation.z - o.z);
             let d = away.length();
-            if d > 0.01 && d < 1.3 {
-                tf.translation += away / d * (1.3 - d) * 2.0 * dt;
+            let min = 1.3 * (size + osize) * 0.5;
+            if d > 0.01 && d < min {
+                tf.translation += away / d * (min - d) * 2.0 * dt;
             }
         }
         e.blend += ((if moving { 1.0 } else { 0.0 }) - e.blend) * (1.0 - (-8.0 * dt).exp());
@@ -1483,10 +1682,10 @@ fn enemy_ai(
         tf.rotation = Quat::from_rotation_y(e.yaw);
 
         e.cooldown -= dt;
-        if e.cooldown <= 0.0 && dist < ENEMY_RANGE && diff.abs() < 0.3 {
+        if e.cooldown <= 0.0 && dist < kind.range() && diff.abs() < 0.3 {
             *shots += 1;
             let k = *shots as i32;
-            let muzzle = tf.translation + Quat::from_rotation_y(e.yaw) * Vec3::new(0.05, 1.25, 0.95);
+            let muzzle = tf.translation + Quat::from_rotation_y(e.yaw) * (Vec3::new(0.05, 1.25, 0.95) * size);
             let aim = target
                 + Vec3::new(
                     (hash(k, 1, 31) - 0.5) * 1.0,
@@ -1494,12 +1693,13 @@ fn enemy_ai(
                     (hash(k, 3, 31) - 0.5) * 1.0,
                 );
             let d = (aim - muzzle).normalize();
-            spawn_bullet(&mut commands, &fx, muzzle, d, 26.0, ENEMY_DAMAGE, false, 0.0);
-            spawn_flash(&mut commands, &fx, &fx.muzzle, muzzle, 0.25, 0.06);
+            spawn_bullet(&mut commands, &fx, muzzle, d, 26.0, kind.damage(), false, 0.0);
+            spawn_flash(&mut commands, &fx, &fx.muzzle, muzzle, 0.25 * size, 0.06);
             // Quieter the farther away the shooter is.
             let vol = (0.45 * (1.0 - dist / 30.0)).clamp(0.08, 0.45);
-            play_sound(&mut commands, &fx.enemy_shot, vol, 0.9 + hash(k, 5, 31) * 0.25);
-            e.cooldown = ENEMY_FIRE_INTERVAL * (0.8 + hash(k, 4, 31) * 0.5);
+            let pitch = (0.9 + hash(k, 5, 31) * 0.25) / size.sqrt();
+            play_sound(&mut commands, &fx.enemy_shot, vol, pitch);
+            e.cooldown = kind.fire_interval() * (0.8 + hash(k, 4, 31) * 0.5);
         }
     }
 }
@@ -1527,7 +1727,7 @@ fn projectiles(
         let mut hit = false;
         if b.from_player {
             for (et, mut hp) in &mut enemies {
-                if seg_dist(prev, next, et.translation + Vec3::Y * 1.0) < 0.55 {
+                if seg_dist(prev, next, et.translation + Vec3::Y * et.scale.y) < 0.55 * et.scale.y {
                     hp.cur -= b.damage;
                     hit = true;
                     break;
@@ -1543,7 +1743,7 @@ fn projectiles(
         let ground = next.y < height(next.x, next.z);
         if ground && b.splash > 0.0 {
             for (et, mut hp) in &mut enemies {
-                if (et.translation + Vec3::Y - next).length() < b.splash {
+                if (et.translation + Vec3::Y * et.scale.y - next).length() < b.splash + 0.4 * et.scale.y {
                     hp.cur -= b.damage;
                 }
             }
@@ -1578,11 +1778,12 @@ fn reap(
     enemies: Query<(Entity, &Transform, &Health), With<Enemy>>,
     mut hero: Query<(&mut Transform, &mut Health, &mut Hero, &mut Energy), Without<Enemy>>,
     mut powers: ResMut<Powers>,
+    mut waves: ResMut<Waves>,
 ) {
     let hero_dead = hero.single().is_ok_and(|(_, hp, _, _)| hp.cur <= 0.0);
     for (e, tf, hp) in &enemies {
         if hp.cur <= 0.0 || hero_dead {
-            spawn_flash(&mut commands, &fx, &fx.boom, tf.translation + Vec3::Y * 1.0, 1.4, 0.35);
+            spawn_flash(&mut commands, &fx, &fx.boom, tf.translation + Vec3::Y * tf.scale.y, 1.4 * tf.scale.y, 0.35);
             commands.entity(e).despawn();
         }
     }
@@ -1594,6 +1795,7 @@ fn reap(
             powers.cooldown = 0.0;
             powers.jet_cooldown = 0.0;
             powers.jet = None;
+            *waves = Waves::default();
             tf.translation = Vec3::new(0.0, height(0.0, 0.0), 0.0);
             h.target = None;
             h.attack = None;
@@ -1886,11 +2088,17 @@ fn barrage(
     mut shots: Local<u32>,
     mut powers: ResMut<Powers>,
     mut energy: Query<&mut Energy>,
+    mut health: Query<&mut Health, With<Hero>>,
     hero: Query<(&Transform, &Hero)>,
 ) {
     let dt = time.delta_secs();
     if let Ok(mut e) = energy.single_mut() {
         e.cur = (e.cur + ENERGY_REGEN * dt).min(e.max);
+    }
+    if let Ok(mut h) = health.single_mut() {
+        if h.cur > 0.0 {
+            h.cur = (h.cur + HERO_REGEN * dt).min(h.max);
+        }
     }
     powers.cooldown = (powers.cooldown - dt).max(0.0);
 

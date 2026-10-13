@@ -33,3 +33,9 @@ the usual ALSA/X11 dev packages installed.
 ## Layout
 
 - `src/main.rs` – everything: terrain generation, character model and animation, camera, input.
+
+## Waves
+
+Enemies come in waves with a 10 second break between them, and each wave is bigger.
+From wave 3 on, big armored droids join in (more of them each wave). You regenerate
+1 health per second and 6 energy per second. If you die, the game restarts at wave 1.
