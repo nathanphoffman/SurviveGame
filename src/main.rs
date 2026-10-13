@@ -324,8 +324,57 @@ impl EnemyKind {
 /// The AI-controlled clone that fights alongside you.
 #[derive(Component)]
 struct Ally {
+    slot: usize,
     yaw: f32,
     cooldown: f32,
+}
+
+/// Each helper gets its own personality so they don't move as a blob.
+struct AllyProfile {
+    speed: f32,
+    range: f32,
+    damage: f32,
+    interval: f32,
+    regroup_dist: f32,  // runs back to the hero beyond this
+    advance_dist: f32,  // only charges enemies while this close to the hero
+    formation: Vec3,    // idle spot relative to the hero (hero-facing space)
+    armor: (f32, f32, f32),
+    armor_dark: (f32, f32, f32),
+    bar: Color,
+    hunts_heavies: bool,
+}
+
+fn ally_profile(slot: usize) -> AllyProfile {
+    if slot == 0 {
+        AllyProfile {
+            speed: 5.0,
+            range: 13.0,
+            damage: 8.0,
+            interval: 0.4,
+            regroup_dist: 11.0,
+            advance_dist: 9.0,
+            formation: Vec3::new(2.5, 0.0, -2.0),
+            armor: (0.30, 0.46, 0.26),
+            armor_dark: (0.18, 0.29, 0.17),
+            bar: Color::srgb(0.3, 0.85, 0.85),
+            hunts_heavies: false,
+        }
+    } else {
+        // Slower, harder-hitting, braver; likes to stand on the other flank and focus heavies.
+        AllyProfile {
+            speed: 4.4,
+            range: 16.0,
+            damage: 12.0,
+            interval: 0.6,
+            regroup_dist: 15.0,
+            advance_dist: 13.0,
+            formation: Vec3::new(-3.5, 0.0, 1.0),
+            armor: (0.55, 0.33, 0.14),
+            armor_dark: (0.34, 0.20, 0.09),
+            bar: Color::srgb(0.95, 0.7, 0.25),
+            hunts_heavies: true,
+        }
+    }
 }
 
 #[derive(Component)]
@@ -333,20 +382,16 @@ struct LimbOwner(Entity);
 
 #[derive(Resource)]
 struct AllyRespawn {
-    timer: f32,
+    timers: [f32; 2],
 }
 
 impl Default for AllyRespawn {
     fn default() -> Self {
-        Self { timer: 1.0 }
+        Self { timers: [1.0, 2.5] }
     }
 }
 
 const ALLY_HP: f32 = 100.0;
-const ALLY_SPEED: f32 = 5.0;
-const ALLY_RANGE: f32 = 13.0;
-const ALLY_DAMAGE: f32 = 8.0;
-const ALLY_FIRE_INTERVAL: f32 = 0.4;
 const ALLY_RESPAWN_TIME: f32 = 15.0;
 
 #[derive(Component)]
@@ -733,7 +778,7 @@ fn setup(
     ));
 
     spawn_scatter(&mut commands, &mut meshes, &mut materials);
-    let hero = spawn_hero(&mut commands, &mut meshes, &mut materials, Vec3::ZERO, false);
+    let hero = spawn_hero(&mut commands, &mut meshes, &mut materials, Vec3::ZERO, None);
     spawn_health_bar(&mut commands, &mut meshes, &mut materials, hero, Meter::Health, 0.0, 1.6, Color::srgb(0.2, 0.9, 0.3));
     spawn_health_bar(&mut commands, &mut meshes, &mut materials, hero, Meter::Energy, 1.0, 1.6, Color::srgb(0.25, 0.55, 1.0));
     spawn_hud(&mut commands);
@@ -893,7 +938,7 @@ fn spawn_hero(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     pos: Vec3,
-    ally: bool,
+    ally: Option<usize>,
 ) -> Entity {
     let mut mat = |r: f32, g: f32, b: f32, metallic: f32, rough: f32| {
         materials.add(StandardMaterial {
@@ -904,8 +949,12 @@ fn spawn_hero(
         })
     };
     // Allies wear green so you can tell them apart from your blue marine.
-    let (armor, armor_dark) = if ally {
-        (mat(0.30, 0.46, 0.26, 0.35, 0.5), mat(0.18, 0.29, 0.17, 0.4, 0.5))
+    let (armor, armor_dark) = if let Some(slot) = ally {
+        let p = ally_profile(slot);
+        (
+            mat(p.armor.0, p.armor.1, p.armor.2, 0.35, 0.5),
+            mat(p.armor_dark.0, p.armor_dark.1, p.armor_dark.2, 0.4, 0.5),
+        )
     } else {
         (mat(0.24, 0.38, 0.52, 0.35, 0.5), mat(0.15, 0.24, 0.34, 0.4, 0.5))
     };
@@ -933,9 +982,10 @@ fn spawn_hero(
             Anim::default(),
         ))
         .id();
-    if ally {
+    if let Some(slot) = ally {
         commands.entity(root).insert((
             Ally {
+                slot,
                 yaw: 0.0,
                 cooldown: 0.0,
             },
@@ -2350,22 +2400,26 @@ fn ally_manager(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut respawn: ResMut<AllyRespawn>,
-    allies: Query<(), With<Ally>>,
+    allies: Query<&Ally>,
     hero: Query<&Transform, With<Hero>>,
 ) {
-    if !allies.is_empty() {
-        return;
-    }
-    respawn.timer -= time.delta_secs();
-    if respawn.timer > 0.0 {
-        return;
-    }
     let Ok(h) = hero.single() else {
         return;
     };
-    let pos = h.translation + Vec3::new(2.5, 0.0, -2.0);
-    let ally = spawn_hero(&mut commands, &mut meshes, &mut materials, pos, true);
-    spawn_health_bar(&mut commands, &mut meshes, &mut materials, ally, Meter::Health, 0.0, 1.4, Color::srgb(0.3, 0.85, 0.85));
+    for slot in 0..2 {
+        if allies.iter().any(|a| a.slot == slot) {
+            continue;
+        }
+        respawn.timers[slot] -= time.delta_secs();
+        if respawn.timers[slot] > 0.0 {
+            continue;
+        }
+        let profile = ally_profile(slot);
+        let pos = h.translation + profile.formation;
+        let ally = spawn_hero(&mut commands, &mut meshes, &mut materials, pos, Some(slot));
+        spawn_health_bar(&mut commands, &mut meshes, &mut materials, ally, Meter::Health, 0.0, 1.4, profile.bar);
+        respawn.timers[slot] = ALLY_RESPAWN_TIME;
+    }
 }
 
 /// Basic ally AI: stay near the hero, shoot the nearest enemy in range,
@@ -2377,7 +2431,7 @@ fn ally_ai(
     mut shots: Local<u32>,
     mut respawn: ResMut<AllyRespawn>,
     hero: Query<(&Transform, &Hero), (Without<Ally>, Without<Enemy>)>,
-    enemies: Query<&Transform, (With<Enemy>, Without<Ally>)>,
+    enemies: Query<(&Transform, &Enemy), Without<Ally>>,
     mut allies: Query<
         (Entity, &mut Transform, &mut Ally, &mut Anim, &mut Health),
         (Without<Enemy>, Without<Hero>),
@@ -2393,7 +2447,7 @@ fn ally_ai(
         if hp.cur <= 0.0 {
             spawn_flash(&mut commands, &fx, &fx.boom, tf.translation + Vec3::Y, 1.4, 0.35);
             commands.entity(entity).despawn();
-            respawn.timer = ALLY_RESPAWN_TIME;
+            respawn.timers[a.slot] = ALLY_RESPAWN_TIME;
             continue;
         }
         hp.cur = (hp.cur + 2.0 * dt).min(hp.max);
@@ -2401,25 +2455,36 @@ fn ally_ai(
         let pos = tf.translation;
         let flat = |p: Vec3| Vec2::new(p.x - pos.x, p.z - pos.z).length();
         let to_hero = flat(hero_pos);
+        let p = ally_profile(a.slot);
+        // Pick a target: nearest, except hunters prefer heavies that are already in range.
         let nearest = enemies
             .iter()
-            .map(|t| (t.translation, flat(t.translation)))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
+            .map(|(t, e)| {
+                let d = flat(t.translation);
+                let bias = if p.hunts_heavies && e.kind == EnemyKind::Heavy && d <= p.range {
+                    -1000.0
+                } else {
+                    0.0
+                };
+                (t.translation, d, d + bias)
+            })
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(pos, d, _)| (pos, d));
 
         let mut goal: Option<Vec3> = None;
         let mut shoot_at: Option<Vec3> = None;
-        if to_hero > 11.0 {
+        if to_hero > p.regroup_dist {
             goal = Some(hero_pos);
         } else if let Some((ep, ed)) = nearest {
-            if ed <= ALLY_RANGE {
+            if ed <= p.range {
                 shoot_at = Some(ep);
-            } else if to_hero < 9.0 {
+            } else if to_hero < p.advance_dist {
                 goal = Some(ep);
             }
         }
         if goal.is_none() && shoot_at.is_none() {
             // Idle: hang out behind the hero's shoulder.
-            let spot = hero_pos + Quat::from_rotation_y(hero.yaw) * Vec3::new(2.5, 0.0, -2.0);
+            let spot = hero_pos + Quat::from_rotation_y(hero.yaw) * p.formation;
             if flat(spot) > 1.0 {
                 goal = Some(spot);
             }
@@ -2438,7 +2503,7 @@ fn ally_ai(
             let d = Vec3::new(g.x - pos.x, 0.0, g.z - pos.z);
             let len = d.length();
             if len > 0.3 && diff.abs() < 1.0 {
-                tf.translation += d / len * (ALLY_SPEED * dt).min(len);
+                tf.translation += d / len * (p.speed * dt).min(len);
                 moving = true;
             }
         }
@@ -2449,11 +2514,11 @@ fn ally_ai(
                 *shots += 1;
                 let muzzle = tf.translation + Quat::from_rotation_y(a.yaw) * Vec3::new(-0.03, 1.31, 1.4);
                 let dir = (target + Vec3::Y - muzzle).normalize();
-                spawn_bullet(&mut commands, &fx, muzzle, dir, 45.0, ALLY_DAMAGE, true, 0.0);
+                spawn_bullet(&mut commands, &fx, muzzle, dir, 45.0, p.damage, true, 0.0);
                 spawn_flash(&mut commands, &fx, &fx.muzzle, muzzle, 0.3, 0.06);
                 let pitch = 1.1 + hash(*shots as i32, 9, 3) * 0.15;
                 play_sound(&mut commands, &fx.player_shot, 0.18, pitch);
-                a.cooldown = ALLY_FIRE_INTERVAL;
+                a.cooldown = p.interval;
             }
         }
 
@@ -2466,7 +2531,7 @@ fn ally_ai(
         let goal_blend = if moving { 1.0 } else { 0.0 };
         anim.blend += (goal_blend - anim.blend) * (1.0 - (-10.0 * dt).exp());
         if moving {
-            anim.phase += ALLY_SPEED * 2.4 * dt;
+            anim.phase += p.speed * 2.4 * dt;
         }
     }
 }

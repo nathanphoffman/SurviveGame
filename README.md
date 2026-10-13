@@ -40,8 +40,12 @@ Enemies come in waves with a 10 second break between them, and each wave is bigg
 From wave 3 on, big armored droids join in (more of them each wave). You regenerate
 1 health per second and 6 energy per second. If you die, the game restarts at wave 1.
 
-## Ally
+## Allies
 
-A green-armored clone of your marine fights with you, controlled by a simple AI: it
-follows you, shoots the nearest enemy in range, and regroups if it falls behind. Enemies
-target whichever of you is closest. If it dies, a new one arrives after 15 seconds.
+Two AI helpers fight alongside you (3 marines total), each with a slightly different personality:
+
+- **Green** – stays close on your right shoulder, shoots the nearest enemy, quick fire rate.
+- **Orange** – holds your left flank, longer range and harder hitting but slower, braver about
+  leaving your side, and focuses heavy droids when they're in range.
+
+Enemies target whichever of you is closest. A fallen helper is replaced after 15 seconds.
