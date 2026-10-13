@@ -1,7 +1,7 @@
 # SurviveGame
 
 A small RTS/MOBA-style prototype in Rust using [Bevy](https://bevy.org) 0.16.
-One always-selected knight on a grass and mud plain, with RTS camera controls.
+One always-selected space marine on a grass and mud plain, with RTS camera controls.
 
 ## Run
 

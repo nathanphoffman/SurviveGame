@@ -192,7 +192,7 @@ enum Limb {
     ShoulderR,
     ElbowL,
     ElbowR,
-    Cape,
+    Rifle,
 }
 
 #[derive(Resource, Default)]
@@ -482,14 +482,24 @@ fn spawn_hero(
             ..default()
         })
     };
-    let skin = mat(0.85, 0.66, 0.52, 0.0, 0.7);
-    let steel = mat(0.72, 0.75, 0.80, 0.55, 0.38);
-    let dark_steel = mat(0.40, 0.42, 0.47, 0.6, 0.45);
-    let gold = mat(0.95, 0.75, 0.30, 0.7, 0.35);
-    let red = mat(0.62, 0.10, 0.10, 0.0, 0.8);
-    let leather = mat(0.36, 0.22, 0.12, 0.0, 0.85);
-    let cloth = mat(0.20, 0.20, 0.26, 0.0, 0.9);
-    let black = mat(0.04, 0.04, 0.05, 0.0, 0.5);
+    let armor = mat(0.24, 0.38, 0.52, 0.35, 0.5);
+    let armor_dark = mat(0.15, 0.24, 0.34, 0.4, 0.5);
+    let under = mat(0.10, 0.11, 0.13, 0.1, 0.8);
+    let trim = mat(0.90, 0.62, 0.10, 0.3, 0.45);
+    let gun = mat(0.17, 0.18, 0.20, 0.8, 0.4);
+    let glove = mat(0.08, 0.08, 0.09, 0.0, 0.9);
+    let visor = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.1, 0.8, 0.95),
+        emissive: LinearRgba::rgb(0.3, 3.0, 4.0),
+        metallic: 0.2,
+        perceptual_roughness: 0.2,
+        ..default()
+    });
+    let glow = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.5, 0.2),
+        emissive: LinearRgba::rgb(4.0, 1.5, 0.3),
+        ..default()
+    });
 
     let hero = Hero {
         target: None,
@@ -508,104 +518,89 @@ fn spawn_hero(
 
     // Body: origin at hip height. Everything else hangs off this.
     let body = b.node(root, t(0.0, 1.04, 0.0), Some(Limb::Body));
-    b.part(body, Cuboid::new(0.38, 0.18, 0.25), &cloth, t(0.0, -0.03, 0.0));
-    b.part(body, Cuboid::new(0.41, 0.06, 0.27), &leather, t(0.0, 0.07, 0.0));
-    b.part(body, Cuboid::new(0.07, 0.07, 0.02), &gold, t(0.0, 0.07, 0.14));
-    // Front and back skirt flaps
-    b.part(body, Cuboid::new(0.30, 0.30, 0.02), &red, t(0.0, -0.16, 0.14));
-    b.part(body, Cuboid::new(0.30, 0.30, 0.02), &red, t(0.0, -0.16, -0.14));
+    b.part(body, Cuboid::new(0.40, 0.18, 0.28), &under, t(0.0, -0.03, 0.0));
+    b.part(body, Cuboid::new(0.44, 0.07, 0.30), &armor_dark, t(0.0, 0.07, 0.0));
+    b.part(body, Cuboid::new(0.10, 0.08, 0.03), &trim, t(0.0, 0.07, 0.16));
+    // Belt pouches and hip guards
+    for side in [1.0, -1.0] {
+        b.part(body, Cuboid::new(0.08, 0.12, 0.12), &gun, t(0.23 * side, 0.0, 0.06));
+        b.part(body, Cuboid::new(0.06, 0.2, 0.26), &armor, t(0.22 * side, -0.1, -0.02));
+    }
+    b.part(body, Cuboid::new(0.28, 0.14, 0.04), &armor, t(0.0, -0.14, 0.15));
 
     // Legs
     for (side, hip_limb, knee_limb) in [(1.0, Limb::HipL, Limb::KneeL), (-1.0, Limb::HipR, Limb::KneeR)] {
-        let hip = b.node(body, t(0.12 * side, -0.08, 0.0), Some(hip_limb));
-        b.part(hip, Sphere::new(0.08), &cloth, t(0.0, 0.0, 0.0));
-        b.part(hip, Capsule3d::new(0.075, 0.30), &cloth, t(0.0, -0.225, 0.0));
+        let hip = b.node(body, t(0.13 * side, -0.08, 0.0), Some(hip_limb));
+        b.part(hip, Sphere::new(0.09), &under, t(0.0, 0.0, 0.0));
+        b.part(hip, Capsule3d::new(0.08, 0.28), &under, t(0.0, -0.225, 0.0));
+        b.part(hip, Cuboid::new(0.17, 0.26, 0.19), &armor, t(0.0, -0.2, 0.02));
         let knee = b.node(hip, t(0.0, -0.45, 0.0), Some(knee_limb));
-        b.part(knee, Sphere::new(0.08), &steel, t(0.0, 0.0, 0.03));
-        b.part(knee, Capsule3d::new(0.065, 0.31), &steel, t(0.0, -0.22, 0.0));
-        b.part(knee, Cuboid::new(0.14, 0.12, 0.30), &leather, t(0.0, -0.45, 0.06));
-        b.part(knee, Cuboid::new(0.15, 0.04, 0.31), &dark_steel, t(0.0, -0.50, 0.06));
+        b.part(knee, Sphere::new(0.1), &armor_dark, t(0.0, 0.0, 0.05));
+        b.part(knee, Capsule3d::new(0.065, 0.3), &under, t(0.0, -0.22, 0.0));
+        b.part(knee, Cuboid::new(0.17, 0.34, 0.2), &armor, t(0.0, -0.24, 0.02));
+        b.part(knee, Cuboid::new(0.17, 0.12, 0.34), &gun, t(0.0, -0.45, 0.06));
+        b.part(knee, Cuboid::new(0.18, 0.06, 0.12), &armor_dark, t(0.0, -0.40, 0.17));
     }
 
     // Torso (twists as one piece)
     let chest = b.node(body, Transform::IDENTITY, Some(Limb::Chest));
-    b.part(chest, Cuboid::new(0.36, 0.18, 0.24), &dark_steel, t(0.0, 0.15, 0.0));
-    b.part(chest, Cuboid::new(0.48, 0.42, 0.29), &steel, t(0.0, 0.40, 0.0));
-    b.part(chest, Cuboid::new(0.14, 0.34, 0.02), &gold, t(0.0, 0.40, 0.15));
-    b.part(chest, Cuboid::new(0.30, 0.10, 0.02), &red, t(0.0, 0.22, 0.14));
-    b.part(chest, Cylinder::new(0.06, 0.10), &skin, t(0.0, 0.66, 0.0));
-    // Pauldrons
+    b.part(chest, Cuboid::new(0.36, 0.2, 0.26), &under, t(0.0, 0.15, 0.0));
+    b.part(chest, Cuboid::new(0.54, 0.44, 0.34), &armor, t(0.0, 0.41, 0.0));
+    b.part(chest, Cuboid::new(0.50, 0.12, 0.30), &armor_dark, t(0.0, 0.23, 0.0));
+    b.part(chest, Cuboid::new(0.12, 0.30, 0.02), &trim, t(0.0, 0.42, 0.175));
+    b.part(chest, Cuboid::new(0.14, 0.12, 0.10), &armor_dark, t(0.0, 0.64, 0.0)); // collar
+    // Shoulder pads
     for side in [1.0, -1.0] {
         b.part(
             chest,
-            Sphere::new(0.13),
-            &steel,
-            t(0.31 * side, 0.58, 0.0).with_scale(Vec3::new(1.0, 0.75, 1.1)),
+            Sphere::new(0.15),
+            &armor,
+            t(0.35 * side, 0.58, 0.0).with_scale(Vec3::new(1.0, 0.8, 1.15)),
         );
-        b.part(
-            chest,
-            Cuboid::new(0.2, 0.025, 0.2),
-            &gold,
-            t(0.32 * side, 0.52, 0.0),
-        );
+        b.part(chest, Cuboid::new(0.05, 0.1, 0.24), &trim, t(0.43 * side, 0.58, 0.0));
     }
+    // Backpack with thrusters
+    b.part(chest, Cuboid::new(0.34, 0.44, 0.18), &armor_dark, t(0.0, 0.36, -0.26));
+    for side in [1.0, -1.0] {
+        b.part(chest, Cylinder::new(0.045, 0.2), &gun, t(0.1 * side, 0.62, -0.28));
+        b.part(chest, Cylinder::new(0.03, 0.03), &glow, t(0.1 * side, 0.1, -0.26));
+    }
+    b.part(chest, Cuboid::new(0.02, 0.5, 0.02), &gun, t(0.14, 0.9, -0.3)); // antenna
 
-    // Head
+    // Head: helmet with glowing visor
     let head = b.node(chest, t(0.0, 0.80, 0.0), Some(Limb::Head));
-    b.part(head, Sphere::new(0.12), &skin, t(0.0, 0.0, 0.01));
-    b.part(
-        head,
-        Sphere::new(0.14),
-        &steel,
-        t(0.0, 0.045, -0.01).with_scale(Vec3::new(1.0, 0.9, 1.1)),
-    );
-    b.part(head, Cuboid::new(0.025, 0.12, 0.02), &steel, t(0.0, 0.0, 0.135));
+    b.part(head, Sphere::new(0.16), &armor, t(0.0, 0.02, -0.01).with_scale(Vec3::new(1.0, 0.95, 1.1)));
+    b.part(head, Cuboid::new(0.2, 0.09, 0.08), &visor, t(0.0, 0.03, 0.12));
+    b.part(head, Cuboid::new(0.14, 0.07, 0.1), &armor_dark, t(0.0, -0.07, 0.1));
+    b.part(head, Cuboid::new(0.04, 0.05, 0.22), &trim, t(0.0, 0.17, -0.02));
     for side in [1.0, -1.0] {
-        b.part(head, Sphere::new(0.015), &black, t(0.045 * side, -0.01, 0.118));
+        b.part(head, Cylinder::new(0.05, 0.05), &armor_dark, t(0.15 * side, 0.0, 0.0).with_rotation(Quat::from_rotation_z(FRAC_PI_2)));
     }
-    b.part(
-        head,
-        Cuboid::new(0.035, 0.09, 0.28),
-        &red,
-        t(0.0, 0.17, -0.04).with_rotation(Quat::from_rotation_x(-0.25)),
-    );
 
-    // Cape
-    let cape = b.node(chest, t(0.0, 0.62, -0.16), Some(Limb::Cape));
-    b.part(cape, Cuboid::new(0.44, 0.85, 0.02), &red, t(0.0, -0.42, 0.0));
+    // Assault rifle, held across the chest with both hands.
+    let rifle = b.node(chest, t(-0.03, 0.27, 0.46), Some(Limb::Rifle));
+    b.part(rifle, Cuboid::new(0.08, 0.12, 0.42), &gun, t(0.0, 0.0, 0.0)); // receiver
+    b.part(rifle, Cuboid::new(0.07, 0.14, 0.22), &armor_dark, t(0.0, -0.02, -0.3)); // stock
+    b.part(rifle, Cuboid::new(0.16, 0.09, 0.28), &armor, t(0.0, -0.01, 0.34)); // handguard
+    b.part(rifle, Cylinder::new(0.02, 0.4), &gun, t(0.0, 0.0, 0.7).with_rotation(Quat::from_rotation_x(FRAC_PI_2)));
+    b.part(rifle, Cylinder::new(0.03, 0.08), &gun, t(0.0, 0.0, 0.92).with_rotation(Quat::from_rotation_x(FRAC_PI_2)));
+    b.part(rifle, Cuboid::new(0.05, 0.2, 0.08), &gun, t(0.0, -0.14, 0.04)); // magazine
+    b.part(rifle, Cuboid::new(0.06, 0.06, 0.18), &gun, t(0.0, 0.09, 0.0)); // sight
+    b.part(rifle, Cuboid::new(0.085, 0.02, 0.2), &glow, t(0.0, 0.065, 0.2)); // energy strip
 
-    // Arms. Character's left (+X) carries the shield, right (-X) the sword.
+    // Arms: both hands on the rifle (left is +X).
     for (side, shoulder_limb, elbow_limb) in [
         (1.0, Limb::ShoulderL, Limb::ElbowL),
         (-1.0, Limb::ShoulderR, Limb::ElbowR),
     ] {
-        let shoulder = b.node(chest, t(0.32 * side, 0.55, 0.0), Some(shoulder_limb));
-        b.part(shoulder, Capsule3d::new(0.055, 0.20), &cloth, t(0.0, -0.16, 0.0));
+        let shoulder = b.node(chest, t(0.35 * side, 0.55, 0.0), Some(shoulder_limb));
+        b.part(shoulder, Capsule3d::new(0.06, 0.2), &under, t(0.0, -0.16, 0.0));
+        b.part(shoulder, Cuboid::new(0.13, 0.16, 0.13), &armor, t(0.0, -0.15, 0.0));
         let elbow = b.node(shoulder, t(0.0, -0.31, 0.0), Some(elbow_limb));
-        b.part(elbow, Capsule3d::new(0.05, 0.17), &steel, t(0.0, -0.14, 0.0));
-        b.part(elbow, Sphere::new(0.055), &skin, t(0.0, -0.29, 0.0));
-
-        if side > 0.0 {
-            let shield = b.node(
-                elbow,
-                t(0.09, -0.14, 0.06).with_rotation(Quat::from_rotation_y(-0.5)),
-                None,
-            );
-            let disc = Quat::from_rotation_z(FRAC_PI_2);
-            b.part(shield, Cylinder::new(0.27, 0.04), &dark_steel, t(0.0, 0.0, 0.0).with_rotation(disc));
-            b.part(shield, Cylinder::new(0.22, 0.045), &red, t(0.012, 0.0, 0.0).with_rotation(disc));
-            b.part(shield, Sphere::new(0.06), &gold, t(0.04, 0.0, 0.0));
-        } else {
-            let sword = b.node(
-                elbow,
-                t(0.0, -0.29, 0.0).with_rotation(Quat::from_rotation_x(1.7)),
-                None,
-            );
-            b.part(sword, Cylinder::new(0.02, 0.14), &leather, t(0.0, 0.0, 0.0));
-            b.part(sword, Sphere::new(0.03), &gold, t(0.0, -0.08, 0.0));
-            b.part(sword, Cuboid::new(0.22, 0.03, 0.045), &gold, t(0.0, 0.08, 0.0));
-            b.part(sword, Cuboid::new(0.05, 0.85, 0.014), &steel, t(0.0, 0.53, 0.0));
-        }
+        b.part(elbow, Sphere::new(0.07), &armor_dark, t(0.0, 0.0, 0.0));
+        b.part(elbow, Capsule3d::new(0.055, 0.16), &under, t(0.0, -0.14, 0.0));
+        b.part(elbow, Cuboid::new(0.12, 0.2, 0.12), &armor, t(0.0, -0.15, 0.0));
+        b.part(elbow, Sphere::new(0.065), &glove, t(0.0, -0.31, 0.0));
     }
 }
 
@@ -710,10 +705,10 @@ fn animate_hero(anim: Res<Anim>, mut limbs: Query<(&Limb, &mut Transform)>) {
         match limb {
             Limb::Body => {
                 tf.translation.y = 1.04 + (2.0 * p).cos() * 0.025 * b + breathe * 0.004 * (1.0 - b);
-                tf.rotation = rx(0.10 * b) * ry(p.sin() * 0.06 * b);
+                tf.rotation = rx(0.07 * b) * ry(p.sin() * 0.05 * b);
             }
             Limb::Chest => {
-                tf.rotation = ry(-p.sin() * 0.16 * b) * rx(breathe * 0.012);
+                tf.rotation = ry(-p.sin() * 0.08 * b) * rx(breathe * 0.012);
             }
             Limb::Head => {
                 tf.rotation = rx(-0.08 * b) * ry(p.sin() * 0.1 * b);
@@ -723,15 +718,15 @@ fn animate_hero(anim: Res<Anim>, mut limbs: Query<(&Limb, &mut Transform)>) {
             Limb::KneeL => tf.rotation = rx((0.05 + 1.0 * p.cos().max(0.0)) * b),
             Limb::KneeR => tf.rotation = rx((0.05 + 1.0 * (-p.cos()).max(0.0)) * b),
             Limb::ShoulderL => {
-                tf.rotation = rz(0.07) * rx(p.sin() * 0.5 * b + breathe * 0.02);
+                tf.rotation = rz(-0.9) * rx(-0.8 + p.sin() * 0.05 * b + breathe * 0.015);
             }
             Limb::ShoulderR => {
-                tf.rotation = rz(-0.07) * rx(-p.sin() * 0.5 * b - 0.12 + breathe * 0.02);
+                tf.rotation = rz(0.9) * rx(-0.6 - p.sin() * 0.05 * b + breathe * 0.015);
             }
-            Limb::ElbowL => tf.rotation = rx(-(0.5 + 0.2 * b)),
-            Limb::ElbowR => tf.rotation = rx(-(0.35 + 0.35 * b) - 0.1 * p.cos() * b),
-            Limb::Cape => {
-                tf.rotation = rx(0.05 + 0.45 * b + (2.0 * p).sin() * 0.06 * b + breathe * 0.015);
+            Limb::ElbowL => tf.rotation = rx(-0.5),
+            Limb::ElbowR => tf.rotation = rx(-0.9),
+            Limb::Rifle => {
+                tf.rotation = rx(-0.03 + (2.0 * p).sin() * 0.025 * b + breathe * 0.01);
             }
         }
     }
