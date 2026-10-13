@@ -335,21 +335,67 @@ struct Barrage {
     timer: f32,
 }
 
+struct Jet {
+    from: Vec3,
+    to: Vec3,
+    t: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Default)]
+enum Ability {
+    #[default]
+    Barrage,
+    Jetpack,
+}
+
+impl Ability {
+    fn cost(self) -> f32 {
+        match self {
+            Ability::Barrage => BARRAGE_COST,
+            Ability::Jetpack => JET_COST,
+        }
+    }
+    fn max_cooldown(self) -> f32 {
+        match self {
+            Ability::Barrage => BARRAGE_COOLDOWN,
+            Ability::Jetpack => JET_COOLDOWN,
+        }
+    }
+}
+
 #[derive(Resource, Default)]
 struct Powers {
     cooldown: f32,
+    jet_cooldown: f32,
     targeting: bool,
+    kind: Ability,
     active: Option<Barrage>,
+    jet: Option<Jet>,
+}
+
+impl Powers {
+    fn cooldown_of(&self, a: Ability) -> f32 {
+        match a {
+            Ability::Barrage => self.cooldown,
+            Ability::Jetpack => self.jet_cooldown,
+        }
+    }
+    fn can_cast(&self, a: Ability, energy: f32) -> bool {
+        self.cooldown_of(a) <= 0.0
+            && energy >= a.cost()
+            && self.jet.is_none()
+            && (a == Ability::Jetpack || self.active.is_none())
+    }
 }
 
 #[derive(Component)]
-struct AbilitySlot;
+struct AbilitySlot(Ability);
 
 #[derive(Component)]
-struct CooldownOverlay;
+struct CooldownOverlay(Ability);
 
 #[derive(Component)]
-struct CooldownText;
+struct CooldownText(Ability);
 
 #[derive(Component)]
 struct AreaCursor;
@@ -361,8 +407,13 @@ const BARRAGE_COOLDOWN: f32 = 12.0;
 const BARRAGE_TIME: f32 = 3.0;
 const BARRAGE_RADIUS: f32 = 5.0;
 const BARRAGE_RATE: f32 = 14.0;
-const BARRAGE_DAMAGE: f32 = 8.0;
+const BARRAGE_DAMAGE: f32 = 20.0;
 const BARRAGE_SPLASH: f32 = 2.0;
+const JET_COST: f32 = 30.0;
+const JET_COOLDOWN: f32 = 8.0;
+const JET_RANGE: f32 = 28.0;
+const JET_TIME: f32 = 1.0;
+const JET_HEIGHT: f32 = 4.5;
 
 
 #[derive(Component)]
@@ -381,6 +432,7 @@ struct Fx {
     boom: Handle<StandardMaterial>,
     player_shot: Handle<AudioSource>,
     enemy_shot: Handle<AudioSource>,
+    jet: Handle<AudioSource>,
 }
 
 #[derive(Resource)]
@@ -423,6 +475,7 @@ struct Anim {
     phase: f32,
     blend: f32,
     time: f32,
+    air: f32,
 }
 
 #[derive(Component)]
@@ -471,6 +524,7 @@ fn main() {
                 ability_input,
                 hero_combat,
                 hero_move,
+                jetpack,
                 barrage,
                 enemy_spawner,
                 enemy_ai,
@@ -626,6 +680,9 @@ fn setup(
         }),
         enemy_shot: sounds.add(AudioSource {
             bytes: make_wav(&synth_enemy_blaster()).into(),
+        }),
+        jet: sounds.add(AudioSource {
+            bytes: make_wav(&synth_jetpack()).into(),
         }),
     });
 
@@ -1063,7 +1120,7 @@ fn issue_orders(
     mut powers: ResMut<Powers>,
     ui: Query<&Interaction>,
 ) {
-    if powers.targeting || ui.iter().any(|i| *i != Interaction::None) {
+    if powers.targeting || powers.jet.is_some() || ui.iter().any(|i| *i != Interaction::None) {
         return;
     }
     let just = buttons.just_pressed(MouseButton::Right) || buttons.just_pressed(MouseButton::Left);
@@ -1168,6 +1225,23 @@ fn synth_enemy_blaster() -> Vec<f32> {
         .collect()
 }
 
+/// Jetpack: a rumbling noise whoosh that swells and fades.
+fn synth_jetpack() -> Vec<f32> {
+    let dur = 0.9;
+    let n = (dur * SAMPLE_RATE) as usize;
+    let mut low = 0.0f32;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / SAMPLE_RATE;
+            let noise = hash(i as i32, 1, 8) * 2.0 - 1.0;
+            let cutoff = 0.04 + 0.12 * (t / dur * std::f32::consts::PI).sin();
+            low += cutoff * (noise - low);
+            let env = (t / dur * std::f32::consts::PI).sin().powf(0.6) * (t / 0.01).min(1.0);
+            (low * 2.2 + 0.08 * (std::f32::consts::TAU * 70.0 * t).sin()) * env * 0.8
+        })
+        .collect()
+}
+
 fn play_sound(commands: &mut Commands, sound: &Handle<AudioSource>, volume: f32, speed: f32) {
     commands.spawn((
         AudioPlayer(sound.clone()),
@@ -1232,6 +1306,11 @@ fn hero_combat(
     };
     h.cooldown = (h.cooldown - time.delta_secs()).max(0.0);
     h.aim = None;
+    if powers.jet.is_some() {
+        h.target = None;
+        h.attack = None;
+        return;
+    }
     if let Some(b) = &powers.active {
         // Channeling the barrage: stand still and face the area.
         h.aim = Some(b.center);
@@ -1513,6 +1592,8 @@ fn reap(
             energy.cur = energy.max;
             powers.active = None;
             powers.cooldown = 0.0;
+            powers.jet_cooldown = 0.0;
+            powers.jet = None;
             tf.translation = Vec3::new(0.0, height(0.0, 0.0), 0.0);
             h.target = None;
             h.attack = None;
@@ -1532,6 +1613,11 @@ fn spawn_hud(commands: &mut Commands) {
         })
         .with_children(|bar| {
             for i in 0..4 {
+                let ability = match i {
+                    0 => Some(Ability::Barrage),
+                    1 => Some(Ability::Jetpack),
+                    _ => None,
+                };
                 let mut slot = bar.spawn((
                     Node {
                         width: Val::Px(64.0),
@@ -1544,55 +1630,74 @@ fn spawn_hud(commands: &mut Commands) {
                     BackgroundColor(Color::srgba(0.07, 0.08, 0.11, 0.85)),
                     BorderColor(Color::srgb(0.30, 0.34, 0.42)),
                 ));
-                let hotkey = Text::new((i + 1).to_string());
-                let hotkey_color = if i == 0 { Color::WHITE } else { Color::srgb(0.4, 0.4, 0.45) };
-                if i != 0 {
+                let hotkey_color = if ability.is_some() { Color::WHITE } else { Color::srgb(0.4, 0.4, 0.45) };
+                let hotkey = (
+                    Node {
+                        position_type: PositionType::Absolute,
+                        top: Val::Px(2.0),
+                        left: Val::Px(5.0),
+                        ..default()
+                    },
+                    Text::new((i + 1).to_string()),
+                    TextFont { font_size: 14.0, ..default() },
+                    TextColor(hotkey_color),
+                );
+                let Some(ability) = ability else {
                     slot.with_children(|s| {
-                        s.spawn((
-                            Node {
-                                position_type: PositionType::Absolute,
-                                top: Val::Px(2.0),
-                                left: Val::Px(5.0),
-                                ..default()
-                            },
-                            hotkey,
-                            TextFont { font_size: 14.0, ..default() },
-                            TextColor(hotkey_color),
-                        ));
+                        s.spawn(hotkey);
                     });
                     continue;
-                }
-                slot.insert((Button, AbilitySlot));
+                };
+                slot.insert((Button, AbilitySlot(ability)));
                 slot.with_children(|s| {
-                    // Icon: three bullets
+                    // Icon
                     s.spawn(Node {
                         column_gap: Val::Px(5.0),
                         align_items: AlignItems::FlexEnd,
                         ..default()
                     })
-                    .with_children(|icon| {
-                        for h in [22.0, 34.0, 26.0] {
-                            icon.spawn((
-                                Node {
-                                    width: Val::Px(8.0),
-                                    height: Val::Px(h),
-                                    ..default()
-                                },
-                                BackgroundColor(Color::srgb(1.0, 0.65, 0.15)),
-                            ));
+                    .with_children(|icon| match ability {
+                        Ability::Barrage => {
+                            for h in [22.0, 34.0, 26.0] {
+                                icon.spawn((
+                                    Node {
+                                        width: Val::Px(8.0),
+                                        height: Val::Px(h),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(1.0, 0.65, 0.15)),
+                                ));
+                            }
+                        }
+                        Ability::Jetpack => {
+                            // Pack body with a flame underneath
+                            icon.spawn(Node {
+                                flex_direction: FlexDirection::Column,
+                                align_items: AlignItems::Center,
+                                row_gap: Val::Px(2.0),
+                                ..default()
+                            })
+                            .with_children(|pack| {
+                                pack.spawn((
+                                    Node {
+                                        width: Val::Px(22.0),
+                                        height: Val::Px(26.0),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.55, 0.65, 0.8)),
+                                ));
+                                pack.spawn((
+                                    Node {
+                                        width: Val::Px(10.0),
+                                        height: Val::Px(14.0),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(1.0, 0.55, 0.1)),
+                                ));
+                            });
                         }
                     });
-                    s.spawn((
-                        Node {
-                            position_type: PositionType::Absolute,
-                            top: Val::Px(2.0),
-                            left: Val::Px(5.0),
-                            ..default()
-                        },
-                        hotkey,
-                        TextFont { font_size: 14.0, ..default() },
-                        TextColor(hotkey_color),
-                    ));
+                    s.spawn(hotkey);
                     s.spawn((
                         Node {
                             position_type: PositionType::Absolute,
@@ -1600,7 +1705,7 @@ fn spawn_hud(commands: &mut Commands) {
                             right: Val::Px(5.0),
                             ..default()
                         },
-                        Text::new(format!("{}", BARRAGE_COST as i32)),
+                        Text::new(format!("{}", ability.cost() as i32)),
                         TextFont { font_size: 14.0, ..default() },
                         TextColor(Color::srgb(0.45, 0.7, 1.0)),
                     ));
@@ -1614,42 +1719,66 @@ fn spawn_hud(commands: &mut Commands) {
                             ..default()
                         },
                         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
-                        CooldownOverlay,
+                        CooldownOverlay(ability),
                     ));
                     s.spawn((
                         Text::new(""),
                         TextFont { font_size: 24.0, ..default() },
                         TextColor(Color::WHITE),
-                        CooldownText,
+                        CooldownText(ability),
                     ));
                 });
             }
         });
 }
 
-/// Icon click / key 1 starts aiming; left-click on the ground casts, right-click or Esc cancels.
+/// Where the jetpack would land if cast at the cursor: capped to its range, kept in the arena.
+fn jet_destination(from: Vec3, cursor: Vec3) -> Vec3 {
+    let mut d = Vec3::new(cursor.x - from.x, 0.0, cursor.z - from.z);
+    if d.length() > JET_RANGE {
+        d = d.normalize() * JET_RANGE;
+    }
+    let lim = HALF - 5.0;
+    let x = (from.x + d.x).clamp(-lim, lim);
+    let z = (from.z + d.z).clamp(-lim, lim);
+    Vec3::new(x, height(x, z), z)
+}
+
+/// Icon click / key 1 or 2 starts aiming; left-click on the ground casts, right-click or Esc cancels.
 fn ability_input(
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<RtsCamera>>,
+    mut commands: Commands,
+    fx: Res<Fx>,
     mut powers: ResMut<Powers>,
     mut energy: Query<&mut Energy>,
-    slots: Query<&Interaction, (Changed<Interaction>, With<AbilitySlot>)>,
+    mut hero: Query<(&Transform, &mut Hero)>,
+    slots: Query<(&Interaction, &AbilitySlot), Changed<Interaction>>,
     ui: Query<&Interaction>,
 ) {
     let Ok(mut energy) = energy.single_mut() else {
         return;
     };
-    let mut trigger = keys.just_pressed(KeyCode::Digit1);
-    if slots.iter().any(|i| *i == Interaction::Pressed) {
-        trigger = true;
+    let mut trigger = None;
+    if keys.just_pressed(KeyCode::Digit1) {
+        trigger = Some(Ability::Barrage);
     }
-    if trigger {
-        if powers.targeting {
+    if keys.just_pressed(KeyCode::Digit2) {
+        trigger = Some(Ability::Jetpack);
+    }
+    for (i, slot) in &slots {
+        if *i == Interaction::Pressed {
+            trigger = Some(slot.0);
+        }
+    }
+    if let Some(a) = trigger {
+        if powers.targeting && powers.kind == a {
             powers.targeting = false;
-        } else if powers.cooldown <= 0.0 && powers.active.is_none() && energy.cur >= BARRAGE_COST {
+        } else if powers.can_cast(a, energy.cur) {
             powers.targeting = true;
+            powers.kind = a;
         }
         return;
     }
@@ -1662,16 +1791,90 @@ fn ability_input(
         let (Ok(window), Ok((cam, cam_tf))) = (windows.single(), camera.single()) else {
             return;
         };
-        if let Some(p) = cursor_ground(window, cam, cam_tf) {
-            energy.cur -= BARRAGE_COST;
-            powers.cooldown = BARRAGE_COOLDOWN;
-            powers.targeting = false;
-            powers.active = Some(Barrage {
-                center: p,
-                remaining: BARRAGE_TIME,
-                timer: 0.0,
-            });
+        let Some(p) = cursor_ground(window, cam, cam_tf) else {
+            return;
+        };
+        match powers.kind {
+            Ability::Barrage => {
+                energy.cur -= BARRAGE_COST;
+                powers.cooldown = BARRAGE_COOLDOWN;
+                powers.targeting = false;
+                powers.active = Some(Barrage {
+                    center: p,
+                    remaining: BARRAGE_TIME,
+                    timer: 0.0,
+                });
+            }
+            Ability::Jetpack => {
+                let Ok((tf, mut h)) = hero.single_mut() else {
+                    return;
+                };
+                let to = jet_destination(tf.translation, p);
+                let d = to - tf.translation;
+                if Vec2::new(d.x, d.z).length() < 0.5 {
+                    return;
+                }
+                energy.cur -= JET_COST;
+                powers.jet_cooldown = JET_COOLDOWN;
+                powers.targeting = false;
+                powers.active = None;
+                powers.jet = Some(Jet {
+                    from: tf.translation,
+                    to,
+                    t: 0.0,
+                });
+                h.yaw = d.x.atan2(d.z);
+                h.target = None;
+                h.attack = None;
+                play_sound(&mut commands, &fx.jet, 0.5, 1.0);
+            }
         }
+    }
+}
+
+/// Carries the hero along the jetpack arc.
+fn jetpack(
+    time: Res<Time>,
+    mut commands: Commands,
+    fx: Res<Fx>,
+    mut powers: ResMut<Powers>,
+    mut anim: ResMut<Anim>,
+    mut trail: Local<f32>,
+    mut hero: Query<(&mut Transform, &Hero)>,
+) {
+    let dt = time.delta_secs();
+    powers.jet_cooldown = (powers.jet_cooldown - dt).max(0.0);
+    let goal = if powers.jet.is_some() { 1.0 } else { 0.0 };
+    anim.air += (goal - anim.air) * (1.0 - (-10.0 * dt).exp());
+
+    let Some(j) = powers.jet.as_mut() else {
+        return;
+    };
+    let Ok((mut tf, h)) = hero.single_mut() else {
+        return;
+    };
+    j.t += dt / JET_TIME;
+    let t = j.t.min(1.0);
+    let eased = t * t * (3.0 - 2.0 * t);
+    let flat = j.from.lerp(j.to, eased);
+    let arc = (t * PI).sin() * JET_HEIGHT;
+    tf.translation = Vec3::new(flat.x, height(flat.x, flat.z) + arc, flat.z);
+
+    // Thruster flames
+    *trail -= dt;
+    if *trail <= 0.0 {
+        *trail = 0.025;
+        let rot = Quat::from_rotation_y(h.yaw);
+        for side in [-1.0, 1.0] {
+            let pos = tf.translation + rot * Vec3::new(0.1 * side, 1.2, -0.3);
+            spawn_flash(&mut commands, &fx, &fx.boom, pos, 0.4, 0.25);
+        }
+    }
+
+    if j.t >= 1.0 {
+        let land = Vec3::new(j.to.x, height(j.to.x, j.to.z), j.to.z);
+        spawn_flash(&mut commands, &fx, &fx.hit, land + Vec3::Y * 0.2, 2.0, 0.25);
+        powers.jet = None;
     }
 }
 
@@ -1729,24 +1932,33 @@ fn update_area_cursor(
     powers: Res<Powers>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<RtsCamera>>,
+    hero: Query<&Transform, (With<Hero>, Without<AreaCursor>)>,
     mut ring: Query<(&mut Transform, &mut Visibility), With<AreaCursor>>,
 ) {
     let Ok((mut tf, mut vis)) = ring.single_mut() else {
         return;
     };
-    let pos = if let Some(b) = &powers.active {
-        Some(b.center)
-    } else if powers.targeting {
-        match (windows.single(), camera.single()) {
-            (Ok(w), Ok((c, g))) => cursor_ground(w, c, g),
+    let cursor = || match (windows.single(), camera.single()) {
+        (Ok(w), Ok((c, g))) => cursor_ground(w, c, g),
+        _ => None,
+    };
+    let (pos, scale) = if let Some(b) = &powers.active {
+        (Some(b.center), 1.0)
+    } else if powers.targeting && powers.kind == Ability::Barrage {
+        (cursor(), 1.0)
+    } else if powers.targeting && powers.kind == Ability::Jetpack {
+        let dest = match (cursor(), hero.single()) {
+            (Some(c), Ok(h)) => Some(jet_destination(h.translation, c)),
             _ => None,
-        }
+        };
+        (dest, 0.3)
     } else {
-        None
+        (None, 1.0)
     };
     match pos {
         Some(p) => {
             tf.translation = p + Vec3::Y * 0.2;
+            tf.scale = Vec3::splat(scale);
             *vis = Visibility::Inherited;
         }
         None => *vis = Visibility::Hidden,
@@ -1756,33 +1968,40 @@ fn update_area_cursor(
 fn update_hud(
     powers: Res<Powers>,
     energy: Query<&Energy>,
-    mut slots: Query<&mut BorderColor, With<AbilitySlot>>,
-    mut overlays: Query<&mut Node, With<CooldownOverlay>>,
-    mut texts: Query<&mut Text, With<CooldownText>>,
+    mut slots: Query<(&mut BorderColor, &AbilitySlot)>,
+    mut overlays: Query<(&mut Node, &CooldownOverlay)>,
+    mut texts: Query<(&mut Text, &CooldownText)>,
 ) {
-    let enough = energy.single().is_ok_and(|e| e.cur >= BARRAGE_COST);
-    for mut border in &mut slots {
-        border.0 = if powers.targeting || powers.active.is_some() {
+    let energy = energy.single().map_or(0.0, |e| e.cur);
+    for (mut border, slot) in &mut slots {
+        let a = slot.0;
+        let busy = match a {
+            Ability::Barrage => powers.active.is_some(),
+            Ability::Jetpack => powers.jet.is_some(),
+        };
+        border.0 = if (powers.targeting && powers.kind == a) || busy {
             Color::srgb(1.0, 0.8, 0.2)
-        } else if powers.cooldown > 0.0 || !enough {
+        } else if powers.cooldown_of(a) > 0.0 || energy < a.cost() {
             Color::srgb(0.30, 0.34, 0.42)
         } else {
             Color::srgb(0.5, 0.9, 1.0)
         };
     }
-    for mut node in &mut overlays {
-        let pct = if powers.cooldown > 0.0 {
-            powers.cooldown / BARRAGE_COOLDOWN * 100.0
-        } else if !enough {
+    for (mut node, o) in &mut overlays {
+        let cd = powers.cooldown_of(o.0);
+        let pct = if cd > 0.0 {
+            cd / o.0.max_cooldown() * 100.0
+        } else if energy < o.0.cost() {
             100.0
         } else {
             0.0
         };
         node.height = Val::Percent(pct);
     }
-    for mut text in &mut texts {
-        text.0 = if powers.cooldown > 0.0 {
-            format!("{}", powers.cooldown.ceil() as i32)
+    for (mut text, t) in &mut texts {
+        let cd = powers.cooldown_of(t.0);
+        text.0 = if cd > 0.0 {
+            format!("{}", cd.ceil() as i32)
         } else {
             String::new()
         };
@@ -1849,6 +2068,7 @@ fn update_health_bars(
 fn animate_hero(anim: Res<Anim>, mut limbs: Query<(&Limb, &mut Transform)>) {
     let p = anim.phase;
     let b = anim.blend;
+    let air = anim.air;
     let breathe = (anim.time * 1.8).sin();
     let rx = Quat::from_rotation_x;
     let ry = Quat::from_rotation_y;
@@ -1858,7 +2078,7 @@ fn animate_hero(anim: Res<Anim>, mut limbs: Query<(&Limb, &mut Transform)>) {
         match limb {
             Limb::Body => {
                 tf.translation.y = 1.04 + (2.0 * p).cos() * 0.025 * b + breathe * 0.004 * (1.0 - b);
-                tf.rotation = rx(0.07 * b) * ry(p.sin() * 0.05 * b);
+                tf.rotation = rx(0.07 * b + 0.5 * air) * ry(p.sin() * 0.05 * b);
             }
             Limb::Chest => {
                 tf.rotation = ry(-p.sin() * 0.08 * b) * rx(breathe * 0.012);
@@ -1866,10 +2086,10 @@ fn animate_hero(anim: Res<Anim>, mut limbs: Query<(&Limb, &mut Transform)>) {
             Limb::Head => {
                 tf.rotation = rx(-0.08 * b) * ry(p.sin() * 0.1 * b);
             }
-            Limb::HipL => tf.rotation = rx(-p.sin() * 0.75 * b),
-            Limb::HipR => tf.rotation = rx(p.sin() * 0.75 * b),
-            Limb::KneeL => tf.rotation = rx((0.05 + 1.0 * p.cos().max(0.0)) * b),
-            Limb::KneeR => tf.rotation = rx((0.05 + 1.0 * (-p.cos()).max(0.0)) * b),
+            Limb::HipL => tf.rotation = rx(-p.sin() * 0.75 * b + 0.45 * air),
+            Limb::HipR => tf.rotation = rx(p.sin() * 0.75 * b + 0.45 * air),
+            Limb::KneeL => tf.rotation = rx((0.05 + 1.0 * p.cos().max(0.0)) * b + 0.5 * air),
+            Limb::KneeR => tf.rotation = rx((0.05 + 1.0 * (-p.cos()).max(0.0)) * b + 0.5 * air),
             Limb::ShoulderL => {
                 tf.rotation = rz(-0.9) * rx(-0.8 + p.sin() * 0.05 * b + breathe * 0.015);
             }
