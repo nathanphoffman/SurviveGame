@@ -6,15 +6,15 @@ use bevy::{
     pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff, NotShadowCaster},
     prelude::*,
     render::mesh::{Indices, PrimitiveTopology},
-    window::PrimaryWindow,
+    window::{MonitorSelection, PrimaryWindow, WindowMode},
 };
 
 // ───────────────────────────── World / terrain ─────────────────────────────
 
-const HALF: f32 = 120.0; // terrain spans [-HALF, HALF] on both axes
-const CELL: f32 = 0.4;
-const EDGE_FADE: f32 = 25.0;
-const CAMERA_LIMIT: f32 = 95.0;
+const HALF: f32 = 40.0; // terrain spans [-HALF, HALF] on both axes
+const CELL: f32 = 1.0;
+const EDGE_FADE: f32 = 10.0;
+const CAMERA_LIMIT: f32 = 28.0;
 const SKY: (f32, f32, f32) = (0.60, 0.72, 0.85);
 const EDGE_GRASS: (f32, f32, f32) = (0.24, 0.38, 0.12);
 
@@ -67,22 +67,22 @@ fn edge_factor(x: f32, z: f32) -> f32 {
 /// 0 = grass, 1 = mud.
 fn mud_mask(x: f32, z: f32) -> f32 {
     let n = fbm(x * 0.035 + 17.0, z * 0.035 - 9.0, 4, 4);
-    let detail = fbm(x * 0.45, z * 0.45, 5, 2) - 0.5;
+    let detail = fbm(x * 0.3, z * 0.3, 5, 2) - 0.5;
     smooth(0.52, 0.62, n + detail * 0.14)
 }
 
 fn height(x: f32, z: f32) -> f32 {
     let broad = (fbm(x * 0.02, z * 0.02, 1, 3) - 0.5) * 1.8;
     let mid = (fbm(x * 0.11, z * 0.11, 2, 3) - 0.5) * 0.55;
-    let fine = (fbm(x * 0.7, z * 0.7, 3, 2) - 0.5) * 0.14;
+    let fine = (fbm(x * 0.35, z * 0.35, 3, 2) - 0.5) * 0.16;
     let mud_dip = -mud_mask(x, z) * 0.28; // mud pools sit in shallow dips
     (broad + mid + fine + mud_dip) * edge_factor(x, z)
 }
 
 fn terrain_color(x: f32, z: f32, h: f32) -> Vec3 {
     let mud = mud_mask(x, z);
-    let patch = fbm(x * 0.9, z * 0.9, 6, 3);
-    let blades = fbm(x * 3.5, z * 3.5, 7, 1);
+    let patch = fbm(x * 0.5, z * 0.5, 6, 2);
+    let blades = fbm(x * 1.2, z * 1.2, 7, 1);
     let dry = smooth(0.55, 0.75, fbm(x * 0.05, z * 0.05, 8, 2));
 
     let grass_dark = Vec3::new(0.14, 0.30, 0.08);
@@ -106,9 +106,12 @@ fn srgb_to_linear_arr(c: Vec3) -> [f32; 4] {
     [l.red, l.green, l.blue, 1.0]
 }
 
-fn build_terrain_mesh() -> Mesh {
-    let n = (2.0 * HALF / CELL) as usize;
+const CHUNKS: usize = 8; // terrain is split into CHUNKS x CHUNKS meshes so culling works
+
+fn build_terrain_chunks() -> Vec<Mesh> {
+    let n = (2.0 * HALF / CELL).round() as usize;
     let stride = n + 1;
+    let per = n / CHUNKS;
     let at = |i: usize| -HALF + i as f32 * CELL;
 
     let mut heights = vec![0.0f32; stride * stride];
@@ -118,41 +121,119 @@ fn build_terrain_mesh() -> Mesh {
         }
     }
 
-    let mut positions = Vec::with_capacity(stride * stride);
-    let mut normals = Vec::with_capacity(stride * stride);
-    let mut uvs = Vec::with_capacity(stride * stride);
-    let mut colors = Vec::with_capacity(stride * stride);
-    for iz in 0..stride {
-        for ix in 0..stride {
-            let (x, z) = (at(ix), at(iz));
-            let h = heights[iz * stride + ix];
-            let hl = heights[iz * stride + ix.saturating_sub(1)];
-            let hr = heights[iz * stride + (ix + 1).min(n)];
-            let hd = heights[iz.saturating_sub(1) * stride + ix];
-            let hu = heights[(iz + 1).min(n) * stride + ix];
-            let normal = Vec3::new(hl - hr, 2.0 * CELL, hd - hu).normalize();
-            positions.push([x, h, z]);
-            normals.push(normal.to_array());
-            uvs.push([x * 0.1, z * 0.1]);
-            colors.push(srgb_to_linear_arr(terrain_color(x, z, h)));
+    let mut out = Vec::with_capacity(CHUNKS * CHUNKS);
+    for cz in 0..CHUNKS {
+        for cx in 0..CHUNKS {
+            let (x0, z0) = (cx * per, cz * per);
+            let side = per + 1;
+            let mut positions = Vec::with_capacity(side * side);
+            let mut normals = Vec::with_capacity(side * side);
+            let mut uvs = Vec::with_capacity(side * side);
+            let mut colors = Vec::with_capacity(side * side);
+            for iz in z0..=z0 + per {
+                for ix in x0..=x0 + per {
+                    let (x, z) = (at(ix), at(iz));
+                    let h = heights[iz * stride + ix];
+                    let hl = heights[iz * stride + ix.saturating_sub(1)];
+                    let hr = heights[iz * stride + (ix + 1).min(n)];
+                    let hd = heights[iz.saturating_sub(1) * stride + ix];
+                    let hu = heights[(iz + 1).min(n) * stride + ix];
+                    let normal = Vec3::new(hl - hr, 2.0 * CELL, hd - hu).normalize();
+                    positions.push([x, h, z]);
+                    normals.push(normal.to_array());
+                    uvs.push([x * 0.1, z * 0.1]);
+                    colors.push(srgb_to_linear_arr(terrain_color(x, z, h)));
+                }
+            }
+            let mut indices = Vec::with_capacity(per * per * 6);
+            for iz in 0..per {
+                for ix in 0..per {
+                    let i = (iz * side + ix) as u32;
+                    let s = side as u32;
+                    indices.extend_from_slice(&[i, i + s, i + 1, i + 1, i + s, i + s + 1]);
+                }
+            }
+            out.push(
+                Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+                    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+                    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+                    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+                    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+                    .with_inserted_indices(Indices::U32(indices)),
+            );
+        }
+    }
+    out
+}
+
+/// All grass blades, baked into one mesh per terrain chunk (a handful of draw calls
+/// instead of tens of thousands of entities).
+fn build_grass_chunks() -> Vec<Mesh> {
+    #[derive(Default)]
+    struct Bucket {
+        pos: Vec<[f32; 3]>,
+        nor: Vec<[f32; 3]>,
+        col: Vec<[f32; 4]>,
+        idx: Vec<u32>,
+    }
+    let mut buckets: Vec<Bucket> = (0..CHUNKS * CHUNKS).map(|_| Bucket::default()).collect();
+    let chunk_size = 2.0 * HALF / CHUNKS as f32;
+    let span = HALF - 8.0;
+    let palette = [
+        Vec3::new(0.20, 0.38, 0.10),
+        Vec3::new(0.30, 0.46, 0.14),
+        Vec3::new(0.42, 0.55, 0.18),
+        Vec3::new(0.46, 0.46, 0.20),
+    ];
+
+    for i in 0..1800 {
+        let x = (hash(i, 0, 100) * 2.0 - 1.0) * span;
+        let z = (hash(i, 1, 100) * 2.0 - 1.0) * span;
+        if mud_mask(x, z) > 0.3 {
+            continue;
+        }
+        let h = height(x, z);
+        let cx = (((x + HALF) / chunk_size) as usize).min(CHUNKS - 1);
+        let cz = (((z + HALF) / chunk_size) as usize).min(CHUNKS - 1);
+        let bucket = &mut buckets[cz * CHUNKS + cx];
+        let base = palette[(hash(i, 2, 100) * palette.len() as f32) as usize % palette.len()];
+
+        for k in 0..5 {
+            let s = 0.6 + hash(i, 10 + k, 100) * 1.0;
+            let a = hash(i, 20 + k, 100) * PI * 2.0;
+            let lean = Vec3::new(
+                (hash(i, 30 + k, 100) - 0.5) * 0.3,
+                0.0,
+                (hash(i, 40 + k, 100) - 0.5) * 0.3,
+            );
+            let c = Vec3::new(
+                x + (hash(i, 50 + k, 100) - 0.5) * 0.25,
+                h - 0.02,
+                z + (hash(i, 60 + k, 100) - 0.5) * 0.25,
+            );
+            let r = Vec3::new(a.cos(), 0.0, a.sin()) * 0.045 * s;
+            let tip = c + lean * s + Vec3::Y * 0.5 * s;
+            let v0 = bucket.pos.len() as u32;
+            for (p, shade) in [(c - r, 0.55), (c + r, 0.55), (tip, 1.15)] {
+                bucket.pos.push(p.to_array());
+                bucket.nor.push([0.0, 1.0, 0.0]);
+                bucket.col.push(srgb_to_linear_arr((base * shade).min(Vec3::ONE)));
+            }
+            bucket.idx.extend_from_slice(&[v0, v0 + 1, v0 + 2]);
         }
     }
 
-    let mut indices = Vec::with_capacity(n * n * 6);
-    for iz in 0..n {
-        for ix in 0..n {
-            let i = (iz * stride + ix) as u32;
-            let s = stride as u32;
-            indices.extend_from_slice(&[i, i + s, i + 1, i + 1, i + s, i + s + 1]);
-        }
-    }
-
-    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-        .with_inserted_indices(Indices::U32(indices))
+    buckets
+        .into_iter()
+        .filter(|b| !b.pos.is_empty())
+        .map(|b| {
+            Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, b.pos)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, b.nor)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, b.col)
+                .with_inserted_indices(Indices::U32(b.idx))
+        })
+        .collect()
 }
 
 /// Where a camera ray hits the terrain.
@@ -224,6 +305,7 @@ fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "SurviveGame".into(),
+                mode: WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
                 resolution: (1280.0_f32, 720.0_f32).into(),
                 ..default()
             }),
@@ -240,6 +322,7 @@ fn main() {
         .add_systems(
             Update,
             (
+                quit_on_escape,
                 issue_orders,
                 hero_move,
                 animate_hero,
@@ -258,16 +341,33 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Terrain
-    commands.spawn((
-        Mesh3d(meshes.add(build_terrain_mesh())),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            perceptual_roughness: 0.95,
-            reflectance: 0.08,
-            ..default()
-        })),
-    ));
+    // Terrain (chunked so off-screen parts are culled)
+    let terrain_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        perceptual_roughness: 0.95,
+        reflectance: 0.08,
+        ..default()
+    });
+    for chunk in build_terrain_chunks() {
+        commands.spawn((Mesh3d(meshes.add(chunk)), MeshMaterial3d(terrain_mat.clone())));
+    }
+
+    // Grass blades
+    let grass_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        perceptual_roughness: 1.0,
+        reflectance: 0.05,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    for chunk in build_grass_chunks() {
+        commands.spawn((
+            Mesh3d(meshes.add(chunk)),
+            MeshMaterial3d(grass_mat.clone()),
+            NotShadowCaster,
+        ));
+    }
 
     // Endless flat ground past the terrain edge, melts into the fog.
     commands.spawn((
@@ -292,9 +392,9 @@ fn setup(
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, -0.9, -0.85, 0.0)),
         CascadeShadowConfigBuilder {
-            num_cascades: 4,
-            first_cascade_far_bound: 12.0,
-            maximum_distance: 140.0,
+            num_cascades: 3,
+            first_cascade_far_bound: 14.0,
+            maximum_distance: 80.0,
             ..default()
         }
         .build(),
@@ -303,7 +403,7 @@ fn setup(
     // Camera
     commands.spawn((
         Camera3d::default(),
-        Msaa::Sample4,
+        Msaa::Sample2,
         Projection::Perspective(PerspectiveProjection {
             fov: 45f32.to_radians(),
             far: 1500.0,
@@ -321,8 +421,8 @@ fn setup(
         RtsCamera {
             focus: Vec3::ZERO,
             yaw: 0.0,
-            zoom: 30.0,
-            zoom_target: 30.0,
+            zoom: 22.0,
+            zoom_target: 22.0,
         },
     ));
 
@@ -352,54 +452,7 @@ fn spawn_scatter(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) {
-    let blade = meshes.add(Cone::new(0.05, 0.5).mesh().resolution(4));
-    let greens: Vec<_> = [
-        (0.20, 0.38, 0.10),
-        (0.30, 0.46, 0.14),
-        (0.42, 0.55, 0.18),
-        (0.46, 0.46, 0.20),
-    ]
-    .iter()
-    .map(|&(r, g, b)| {
-        materials.add(StandardMaterial {
-            base_color: Color::srgb(r, g, b),
-            perceptual_roughness: 1.0,
-            ..default()
-        })
-    })
-    .collect();
-
     let span = HALF - 8.0;
-    for i in 0..9000 {
-        let x = (hash(i, 0, 100) * 2.0 - 1.0) * span;
-        let z = (hash(i, 1, 100) * 2.0 - 1.0) * span;
-        if mud_mask(x, z) > 0.3 {
-            continue;
-        }
-        let h = height(x, z);
-        let mat = &greens[(hash(i, 2, 100) * greens.len() as f32) as usize % greens.len()];
-        for k in 0..3 {
-            let s = 0.6 + hash(i, 10 + k, 100) * 1.1;
-            let yaw = hash(i, 20 + k, 100) * PI * 2.0;
-            let tilt_x = (hash(i, 30 + k, 100) - 0.5) * 0.7;
-            let tilt_z = (hash(i, 40 + k, 100) - 0.5) * 0.7;
-            let ox = (hash(i, 50 + k, 100) - 0.5) * 0.18;
-            let oz = (hash(i, 60 + k, 100) - 0.5) * 0.18;
-            commands.spawn((
-                Mesh3d(blade.clone()),
-                MeshMaterial3d(mat.clone()),
-                Transform {
-                    translation: Vec3::new(x + ox, h + 0.22 * s, z + oz),
-                    rotation: Quat::from_rotation_y(yaw)
-                        * Quat::from_rotation_x(tilt_x)
-                        * Quat::from_rotation_z(tilt_z),
-                    scale: Vec3::new(1.0, s, 1.0),
-                },
-                NotShadowCaster,
-            ));
-        }
-    }
-
     let rock_mesh = meshes.add(Sphere::new(1.0).mesh().ico(2).unwrap());
     let rock_mats: Vec<_> = [(0.42, 0.40, 0.37), (0.34, 0.32, 0.30), (0.48, 0.44, 0.38)]
         .iter()
@@ -411,7 +464,7 @@ fn spawn_scatter(
             })
         })
         .collect();
-    for i in 0..110 {
+    for i in 0..25 {
         let x = (hash(i, 0, 200) * 2.0 - 1.0) * span;
         let z = (hash(i, 1, 200) * 2.0 - 1.0) * span;
         if x * x + z * z < 36.0 {
@@ -605,6 +658,12 @@ fn spawn_hero(
 }
 
 // ───────────────────────────── Systems ─────────────────────────────
+
+fn quit_on_escape(keys: Res<ButtonInput<KeyCode>>, mut exit: EventWriter<AppExit>) {
+    if keys.just_pressed(KeyCode::Escape) {
+        exit.write(AppExit::Success);
+    }
+}
 
 fn cursor_ground(
     window: &Window,
@@ -820,7 +879,7 @@ fn camera_control(
         MouseScrollUnit::Pixel => scroll.delta.y / 40.0,
     };
     if scroll_y != 0.0 {
-        cam.zoom_target = (cam.zoom_target * 0.88f32.powf(scroll_y)).clamp(6.0, 60.0);
+        cam.zoom_target = (cam.zoom_target * 0.88f32.powf(scroll_y)).clamp(6.0, 45.0);
     }
     cam.zoom += (cam.zoom_target - cam.zoom) * (1.0 - (-10.0 * dt).exp());
 
@@ -829,7 +888,7 @@ fn camera_control(
     cam.focus.y = height(cam.focus.x, cam.focus.z);
 
     // Closer = lower angle, farther = more top-down.
-    let t = smooth(6.0, 60.0, cam.zoom);
+    let t = smooth(6.0, 45.0, cam.zoom);
     let pitch = 0.62 + (1.05 - 0.62) * t;
     let offset = rot * Quat::from_rotation_x(-pitch) * Vec3::Z * cam.zoom;
     tf.translation = cam.focus + Vec3::Y * 0.8 + offset;
