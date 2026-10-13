@@ -321,6 +321,34 @@ impl EnemyKind {
     }
 }
 
+/// The AI-controlled clone that fights alongside you.
+#[derive(Component)]
+struct Ally {
+    yaw: f32,
+    cooldown: f32,
+}
+
+#[derive(Component)]
+struct LimbOwner(Entity);
+
+#[derive(Resource)]
+struct AllyRespawn {
+    timer: f32,
+}
+
+impl Default for AllyRespawn {
+    fn default() -> Self {
+        Self { timer: 1.0 }
+    }
+}
+
+const ALLY_HP: f32 = 100.0;
+const ALLY_SPEED: f32 = 5.0;
+const ALLY_RANGE: f32 = 13.0;
+const ALLY_DAMAGE: f32 = 8.0;
+const ALLY_FIRE_INTERVAL: f32 = 0.4;
+const ALLY_RESPAWN_TIME: f32 = 15.0;
+
 #[derive(Component)]
 struct Enemy {
     kind: EnemyKind,
@@ -530,7 +558,7 @@ enum Limb {
     Rifle,
 }
 
-#[derive(Resource, Default)]
+#[derive(Component, Default)]
 struct Anim {
     phase: f32,
     blend: f32,
@@ -572,33 +600,39 @@ fn main() {
             brightness: 450.0,
             ..default()
         })
-        .init_resource::<Anim>()
+        .init_resource::<AllyRespawn>()
         .init_resource::<Powers>()
         .init_resource::<Waves>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
-                quit_on_escape,
-                issue_orders,
-                ability_input,
-                hero_combat,
-                hero_move,
-                jetpack,
-                barrage,
-                wave_manager,
-                enemy_ai,
-                projectiles,
-                update_flashes,
-                reap,
-                animate_hero,
-                animate_enemies,
-                camera_control,
-                update_health_bars,
-                update_marker,
-                update_area_cursor,
-                update_hud,
-                update_wave_ui,
+                (
+                    quit_on_escape,
+                    issue_orders,
+                    ability_input,
+                    hero_combat,
+                    hero_move,
+                    ally_manager,
+                    ally_ai,
+                    jetpack,
+                    barrage,
+                    wave_manager,
+                    enemy_ai,
+                ).chain(),
+                (
+                    projectiles,
+                    update_flashes,
+                    reap,
+                    animate_hero,
+                    animate_enemies,
+                    camera_control,
+                    update_health_bars,
+                    update_marker,
+                    update_area_cursor,
+                    update_hud,
+                    update_wave_ui,
+                ).chain(),
             )
                 .chain(),
         )
@@ -699,7 +733,7 @@ fn setup(
     ));
 
     spawn_scatter(&mut commands, &mut meshes, &mut materials);
-    let hero = spawn_hero(&mut commands, &mut meshes, &mut materials);
+    let hero = spawn_hero(&mut commands, &mut meshes, &mut materials, Vec3::ZERO, false);
     spawn_health_bar(&mut commands, &mut meshes, &mut materials, hero, Meter::Health, 0.0, 1.6, Color::srgb(0.2, 0.9, 0.3));
     spawn_health_bar(&mut commands, &mut meshes, &mut materials, hero, Meter::Energy, 1.0, 1.6, Color::srgb(0.25, 0.55, 1.0));
     spawn_hud(&mut commands);
@@ -824,13 +858,14 @@ fn spawn_scatter(
 struct Builder<'a, 'w, 's> {
     c: &'a mut Commands<'w, 's>,
     meshes: &'a mut Assets<Mesh>,
+    owner: Entity,
 }
 
 impl Builder<'_, '_, '_> {
     fn node(&mut self, parent: Entity, t: Transform, limb: Option<Limb>) -> Entity {
         let mut e = self.c.spawn((t, Visibility::default()));
         if let Some(l) = limb {
-            e.insert(l);
+            e.insert((l, LimbOwner(self.owner)));
         }
         let id = e.id();
         self.c.entity(parent).add_child(id);
@@ -857,6 +892,8 @@ fn spawn_hero(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    pos: Vec3,
+    ally: bool,
 ) -> Entity {
     let mut mat = |r: f32, g: f32, b: f32, metallic: f32, rough: f32| {
         materials.add(StandardMaterial {
@@ -866,8 +903,12 @@ fn spawn_hero(
             ..default()
         })
     };
-    let armor = mat(0.24, 0.38, 0.52, 0.35, 0.5);
-    let armor_dark = mat(0.15, 0.24, 0.34, 0.4, 0.5);
+    // Allies wear green so you can tell them apart from your blue marine.
+    let (armor, armor_dark) = if ally {
+        (mat(0.30, 0.46, 0.26, 0.35, 0.5), mat(0.18, 0.29, 0.17, 0.4, 0.5))
+    } else {
+        (mat(0.24, 0.38, 0.52, 0.35, 0.5), mat(0.15, 0.24, 0.34, 0.4, 0.5))
+    };
     let under = mat(0.10, 0.11, 0.13, 0.1, 0.8);
     let trim = mat(0.90, 0.62, 0.10, 0.3, 0.45);
     let gun = mat(0.17, 0.18, 0.20, 0.8, 0.4);
@@ -885,19 +926,34 @@ fn spawn_hero(
         ..default()
     });
 
-    let hero = Hero {
-        target: None,
-        attack: None,
-        aim: None,
-        cooldown: 0.0,
-        speed: 5.5,
-        yaw: 0.0,
-    };
     let root = commands
         .spawn((
-            Transform::from_xyz(0.0, height(0.0, 0.0), 0.0),
+            Transform::from_xyz(pos.x, height(pos.x, pos.z), pos.z),
             Visibility::default(),
-            hero,
+            Anim::default(),
+        ))
+        .id();
+    if ally {
+        commands.entity(root).insert((
+            Ally {
+                yaw: 0.0,
+                cooldown: 0.0,
+            },
+            Health {
+                cur: ALLY_HP,
+                max: ALLY_HP,
+            },
+        ));
+    } else {
+        commands.entity(root).insert((
+            Hero {
+                target: None,
+                attack: None,
+                aim: None,
+                cooldown: 0.0,
+                speed: 5.5,
+                yaw: 0.0,
+            },
             Health {
                 cur: HERO_HP,
                 max: HERO_HP,
@@ -906,9 +962,9 @@ fn spawn_hero(
                 cur: ENERGY_MAX,
                 max: ENERGY_MAX,
             },
-        ))
-        .id();
-    let mut b = Builder { c: commands, meshes };
+        ));
+    }
+    let mut b = Builder { c: commands, meshes, owner: root };
     let t = Transform::from_xyz;
 
     // Body: origin at hip height. Everything else hangs off this.
@@ -1074,7 +1130,7 @@ fn spawn_enemy(
             },
         ))
         .id();
-    let mut b = Builder { c: commands, meshes };
+    let mut b = Builder { c: commands, meshes, owner: root };
     let t = Transform::from_xyz;
 
     let body = b.enode(root, t(0.0, 0.95, 0.0), root, Some(EKind::Body));
@@ -1463,10 +1519,9 @@ fn hero_combat(
 
 fn hero_move(
     time: Res<Time>,
-    mut hero: Query<(&mut Transform, &mut Hero)>,
-    mut anim: ResMut<Anim>,
+    mut hero: Query<(&mut Transform, &mut Hero, &mut Anim)>,
 ) {
-    let Ok((mut tf, mut hero)) = hero.single_mut() else {
+    let Ok((mut tf, mut hero, mut anim)) = hero.single_mut() else {
         return;
     };
     let dt = time.delta_secs();
@@ -1642,18 +1697,23 @@ fn enemy_ai(
     fx: Res<Fx>,
     mut shots: Local<u32>,
     hero: Query<&Transform, (With<Hero>, Without<Enemy>)>,
+    allies: Query<&Transform, (With<Ally>, Without<Enemy>, Without<Hero>)>,
     mut enemies: Query<(&mut Transform, &mut Enemy)>,
 ) {
     let Ok(hero_tf) = hero.single() else {
         return;
     };
     let dt = time.delta_secs();
-    let target = hero_tf.translation;
+    let mut targets: Vec<Vec3> = vec![hero_tf.translation];
+    targets.extend(allies.iter().map(|t| t.translation));
     let others: Vec<(Vec3, f32)> = enemies.iter().map(|(t, e)| (t.translation, e.kind.size())).collect();
 
     for (mut tf, mut e) in &mut enemies {
         let kind = e.kind;
         let size = kind.size();
+        let me = tf.translation;
+        let flat = |p: &Vec3| Vec2::new(p.x - me.x, p.z - me.z).length();
+        let target = *targets.iter().min_by(|a, b| flat(a).total_cmp(&flat(b))).unwrap();
         let to = Vec3::new(target.x - tf.translation.x, 0.0, target.z - tf.translation.z);
         let dist = to.length();
         let dir = to / dist.max(0.001);
@@ -1717,6 +1777,7 @@ fn projectiles(
     mut bullets: Query<(Entity, &mut Transform, &mut Projectile), (Without<Enemy>, Without<Hero>)>,
     mut enemies: Query<(&Transform, &mut Health), (With<Enemy>, Without<Projectile>)>,
     mut hero: Query<(&Transform, &mut Health), (With<Hero>, Without<Enemy>, Without<Projectile>)>,
+    mut allies: Query<(&Transform, &mut Health), (With<Ally>, Without<Hero>, Without<Enemy>, Without<Projectile>)>,
 ) {
     let dt = time.delta_secs();
     for (entity, mut tf, mut b) in &mut bullets {
@@ -1733,10 +1794,21 @@ fn projectiles(
                     break;
                 }
             }
-        } else if let Ok((ht, mut hp)) = hero.single_mut() {
-            if seg_dist(prev, next, ht.translation + Vec3::Y * 1.0) < 0.5 {
-                hp.cur -= b.damage;
-                hit = true;
+        } else {
+            if let Ok((ht, mut hp)) = hero.single_mut() {
+                if seg_dist(prev, next, ht.translation + Vec3::Y * 1.0) < 0.5 {
+                    hp.cur -= b.damage;
+                    hit = true;
+                }
+            }
+            if !hit {
+                for (at, mut hp) in &mut allies {
+                    if seg_dist(prev, next, at.translation + Vec3::Y * 1.0) < 0.5 {
+                        hp.cur -= b.damage;
+                        hit = true;
+                        break;
+                    }
+                }
             }
         }
 
@@ -2040,19 +2112,18 @@ fn jetpack(
     mut commands: Commands,
     fx: Res<Fx>,
     mut powers: ResMut<Powers>,
-    mut anim: ResMut<Anim>,
     mut trail: Local<f32>,
-    mut hero: Query<(&mut Transform, &Hero)>,
+    mut hero: Query<(&mut Transform, &Hero, &mut Anim)>,
 ) {
     let dt = time.delta_secs();
     powers.jet_cooldown = (powers.jet_cooldown - dt).max(0.0);
+    let Ok((mut tf, h, mut anim)) = hero.single_mut() else {
+        return;
+    };
     let goal = if powers.jet.is_some() { 1.0 } else { 0.0 };
     anim.air += (goal - anim.air) * (1.0 - (-10.0 * dt).exp());
 
     let Some(j) = powers.jet.as_mut() else {
-        return;
-    };
-    let Ok((mut tf, h)) = hero.single_mut() else {
         return;
     };
     j.t += dt / JET_TIME;
@@ -2273,16 +2344,146 @@ fn update_health_bars(
     }
 }
 
-fn animate_hero(anim: Res<Anim>, mut limbs: Query<(&Limb, &mut Transform)>) {
-    let p = anim.phase;
-    let b = anim.blend;
-    let air = anim.air;
-    let breathe = (anim.time * 1.8).sin();
+fn ally_manager(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut respawn: ResMut<AllyRespawn>,
+    allies: Query<(), With<Ally>>,
+    hero: Query<&Transform, With<Hero>>,
+) {
+    if !allies.is_empty() {
+        return;
+    }
+    respawn.timer -= time.delta_secs();
+    if respawn.timer > 0.0 {
+        return;
+    }
+    let Ok(h) = hero.single() else {
+        return;
+    };
+    let pos = h.translation + Vec3::new(2.5, 0.0, -2.0);
+    let ally = spawn_hero(&mut commands, &mut meshes, &mut materials, pos, true);
+    spawn_health_bar(&mut commands, &mut meshes, &mut materials, ally, Meter::Health, 0.0, 1.4, Color::srgb(0.3, 0.85, 0.85));
+}
+
+/// Basic ally AI: stay near the hero, shoot the nearest enemy in range,
+/// advance on enemies only while close to the hero, regroup when too far.
+fn ally_ai(
+    time: Res<Time>,
+    mut commands: Commands,
+    fx: Res<Fx>,
+    mut shots: Local<u32>,
+    mut respawn: ResMut<AllyRespawn>,
+    hero: Query<(&Transform, &Hero), (Without<Ally>, Without<Enemy>)>,
+    enemies: Query<&Transform, (With<Enemy>, Without<Ally>)>,
+    mut allies: Query<
+        (Entity, &mut Transform, &mut Ally, &mut Anim, &mut Health),
+        (Without<Enemy>, Without<Hero>),
+    >,
+) {
+    let Ok((hero_tf, hero)) = hero.single() else {
+        return;
+    };
+    let dt = time.delta_secs();
+    let hero_pos = hero_tf.translation;
+
+    for (entity, mut tf, mut a, mut anim, mut hp) in &mut allies {
+        if hp.cur <= 0.0 {
+            spawn_flash(&mut commands, &fx, &fx.boom, tf.translation + Vec3::Y, 1.4, 0.35);
+            commands.entity(entity).despawn();
+            respawn.timer = ALLY_RESPAWN_TIME;
+            continue;
+        }
+        hp.cur = (hp.cur + 2.0 * dt).min(hp.max);
+
+        let pos = tf.translation;
+        let flat = |p: Vec3| Vec2::new(p.x - pos.x, p.z - pos.z).length();
+        let to_hero = flat(hero_pos);
+        let nearest = enemies
+            .iter()
+            .map(|t| (t.translation, flat(t.translation)))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+
+        let mut goal: Option<Vec3> = None;
+        let mut shoot_at: Option<Vec3> = None;
+        if to_hero > 11.0 {
+            goal = Some(hero_pos);
+        } else if let Some((ep, ed)) = nearest {
+            if ed <= ALLY_RANGE {
+                shoot_at = Some(ep);
+            } else if to_hero < 9.0 {
+                goal = Some(ep);
+            }
+        }
+        if goal.is_none() && shoot_at.is_none() {
+            // Idle: hang out behind the hero's shoulder.
+            let spot = hero_pos + Quat::from_rotation_y(hero.yaw) * Vec3::new(2.5, 0.0, -2.0);
+            if flat(spot) > 1.0 {
+                goal = Some(spot);
+            }
+        }
+
+        let mut moving = false;
+        let face = goal.or(shoot_at);
+        let mut diff = 0.0;
+        if let Some(f) = face {
+            let desired = (f.x - pos.x).atan2(f.z - pos.z);
+            diff = wrap_angle(desired - a.yaw);
+            a.yaw += diff.clamp(-10.0 * dt, 10.0 * dt);
+            diff = wrap_angle(desired - a.yaw);
+        }
+        if let Some(g) = goal {
+            let d = Vec3::new(g.x - pos.x, 0.0, g.z - pos.z);
+            let len = d.length();
+            if len > 0.3 && diff.abs() < 1.0 {
+                tf.translation += d / len * (ALLY_SPEED * dt).min(len);
+                moving = true;
+            }
+        }
+
+        a.cooldown = (a.cooldown - dt).max(0.0);
+        if let Some(target) = shoot_at {
+            if diff.abs() < 0.2 && a.cooldown <= 0.0 {
+                *shots += 1;
+                let muzzle = tf.translation + Quat::from_rotation_y(a.yaw) * Vec3::new(-0.03, 1.31, 1.4);
+                let dir = (target + Vec3::Y - muzzle).normalize();
+                spawn_bullet(&mut commands, &fx, muzzle, dir, 45.0, ALLY_DAMAGE, true, 0.0);
+                spawn_flash(&mut commands, &fx, &fx.muzzle, muzzle, 0.3, 0.06);
+                let pitch = 1.1 + hash(*shots as i32, 9, 3) * 0.15;
+                play_sound(&mut commands, &fx.player_shot, 0.18, pitch);
+                a.cooldown = ALLY_FIRE_INTERVAL;
+            }
+        }
+
+        tf.translation.x = tf.translation.x.clamp(-HALF + 5.0, HALF - 5.0);
+        tf.translation.z = tf.translation.z.clamp(-HALF + 5.0, HALF - 5.0);
+        tf.translation.y = height(tf.translation.x, tf.translation.z);
+        tf.rotation = Quat::from_rotation_y(a.yaw);
+
+        anim.time += dt;
+        let goal_blend = if moving { 1.0 } else { 0.0 };
+        anim.blend += (goal_blend - anim.blend) * (1.0 - (-10.0 * dt).exp());
+        if moving {
+            anim.phase += ALLY_SPEED * 2.4 * dt;
+        }
+    }
+}
+
+fn animate_hero(anims: Query<&Anim>, mut limbs: Query<(&Limb, &LimbOwner, &mut Transform)>) {
     let rx = Quat::from_rotation_x;
     let ry = Quat::from_rotation_y;
     let rz = Quat::from_rotation_z;
 
-    for (limb, mut tf) in &mut limbs {
+    for (limb, owner, mut tf) in &mut limbs {
+        let Ok(anim) = anims.get(owner.0) else {
+            continue;
+        };
+        let p = anim.phase;
+        let b = anim.blend;
+        let air = anim.air;
+        let breathe = (anim.time * 1.8).sin();
         match limb {
             Limb::Body => {
                 tf.translation.y = 1.04 + (2.0 * p).cos() * 0.025 * b + breathe * 0.004 * (1.0 - b);

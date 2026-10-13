@@ -39,3 +39,9 @@ the usual ALSA/X11 dev packages installed.
 Enemies come in waves with a 10 second break between them, and each wave is bigger.
 From wave 3 on, big armored droids join in (more of them each wave). You regenerate
 1 health per second and 6 energy per second. If you die, the game restarts at wave 1.
+
+## Ally
+
+A green-armored clone of your marine fights with you, controlled by a simple AI: it
+follows you, shoots the nearest enemy in range, and regroups if it falls behind. Enemies
+target whichever of you is closest. If it dies, a new one arrives after 15 seconds.
