@@ -25,6 +25,9 @@ the usual ALSA/X11 dev packages installed.
 | Mouse wheel | Zoom in / out |
 | Q / E | Rotate camera |
 | Space (hold) | Recenter camera on the character |
+| Click a droid | Attack it (the marine also auto-fires at the nearest droid in range when standing still) |
+| 1 or click the ability icon | Aim **Suppressive Barrage**; left-click the ground to fire, right-click/Esc to cancel |
+| Esc | Cancel aiming, otherwise quit |
 
 ## Layout
 

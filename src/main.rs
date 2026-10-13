@@ -1,6 +1,7 @@
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use bevy::{
+    audio::Volume,
     asset::RenderAssetUsages,
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit},
     pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff, NotShadowCaster},
@@ -299,6 +300,7 @@ struct Projectile {
     life: f32,
     damage: f32,
     from_player: bool,
+    splash: f32,
 }
 
 #[derive(Component)]
@@ -308,10 +310,60 @@ struct Flash {
     size: f32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Meter {
+    Health,
+    Energy,
+}
+
 #[derive(Component)]
 struct HealthBar {
     owner: Entity,
+    meter: Meter,
+    row: f32,
 }
+
+#[derive(Component)]
+struct Energy {
+    cur: f32,
+    max: f32,
+}
+
+struct Barrage {
+    center: Vec3,
+    remaining: f32,
+    timer: f32,
+}
+
+#[derive(Resource, Default)]
+struct Powers {
+    cooldown: f32,
+    targeting: bool,
+    active: Option<Barrage>,
+}
+
+#[derive(Component)]
+struct AbilitySlot;
+
+#[derive(Component)]
+struct CooldownOverlay;
+
+#[derive(Component)]
+struct CooldownText;
+
+#[derive(Component)]
+struct AreaCursor;
+
+const ENERGY_MAX: f32 = 100.0;
+const ENERGY_REGEN: f32 = 6.0;
+const BARRAGE_COST: f32 = 40.0;
+const BARRAGE_COOLDOWN: f32 = 12.0;
+const BARRAGE_TIME: f32 = 3.0;
+const BARRAGE_RADIUS: f32 = 5.0;
+const BARRAGE_RATE: f32 = 14.0;
+const BARRAGE_DAMAGE: f32 = 8.0;
+const BARRAGE_SPLASH: f32 = 2.0;
+
 
 #[derive(Component)]
 struct HealthFill {
@@ -327,6 +379,8 @@ struct Fx {
     muzzle: Handle<StandardMaterial>,
     hit: Handle<StandardMaterial>,
     boom: Handle<StandardMaterial>,
+    player_shot: Handle<AudioSource>,
+    enemy_shot: Handle<AudioSource>,
 }
 
 #[derive(Resource)]
@@ -406,6 +460,7 @@ fn main() {
             ..default()
         })
         .init_resource::<Anim>()
+        .init_resource::<Powers>()
         .insert_resource(Spawner { timer: 2.0, n: 0 })
         .add_systems(Startup, setup)
         .add_systems(
@@ -413,8 +468,10 @@ fn main() {
             (
                 quit_on_escape,
                 issue_orders,
+                ability_input,
                 hero_combat,
                 hero_move,
+                barrage,
                 enemy_spawner,
                 enemy_ai,
                 projectiles,
@@ -425,6 +482,8 @@ fn main() {
                 camera_control,
                 update_health_bars,
                 update_marker,
+                update_area_cursor,
+                update_hud,
             )
                 .chain(),
         )
@@ -437,6 +496,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut sounds: ResMut<Assets<AudioSource>>,
 ) {
     // Terrain (chunked so off-screen parts are culled)
     let terrain_mat = materials.add(StandardMaterial {
@@ -525,7 +585,25 @@ fn setup(
 
     spawn_scatter(&mut commands, &mut meshes, &mut materials);
     let hero = spawn_hero(&mut commands, &mut meshes, &mut materials);
-    spawn_health_bar(&mut commands, &mut meshes, &mut materials, hero, 1.6, Color::srgb(0.2, 0.9, 0.3));
+    spawn_health_bar(&mut commands, &mut meshes, &mut materials, hero, Meter::Health, 0.0, 1.6, Color::srgb(0.2, 0.9, 0.3));
+    spawn_health_bar(&mut commands, &mut meshes, &mut materials, hero, Meter::Energy, 1.0, 1.6, Color::srgb(0.25, 0.55, 1.0));
+    spawn_hud(&mut commands);
+
+    // Ring showing the barrage target area
+    commands.spawn((
+        Mesh3d(meshes.add(Annulus::new(BARRAGE_RADIUS - 0.2, BARRAGE_RADIUS))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 0.45, 0.1, 0.8),
+            unlit: true,
+            alpha_mode: AlphaMode::Blend,
+            cull_mode: None,
+            ..default()
+        })),
+        Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2)),
+        Visibility::Hidden,
+        NotShadowCaster,
+        AreaCursor,
+    ));
 
     let glow = |c: Color, e: LinearRgba, materials: &mut Assets<StandardMaterial>| {
         materials.add(StandardMaterial {
@@ -543,6 +621,12 @@ fn setup(
         muzzle: glow(Color::srgb(1.0, 0.95, 0.6), LinearRgba::rgb(8.0, 7.0, 3.0), &mut materials),
         hit: glow(Color::srgb(1.0, 0.8, 0.4), LinearRgba::rgb(8.0, 5.0, 1.0), &mut materials),
         boom: glow(Color::srgb(1.0, 0.5, 0.15), LinearRgba::rgb(10.0, 3.5, 0.5), &mut materials),
+        player_shot: sounds.add(AudioSource {
+            bytes: make_wav(&synth_player_laser()).into(),
+        }),
+        enemy_shot: sounds.add(AudioSource {
+            bytes: make_wav(&synth_enemy_blaster()).into(),
+        }),
     });
 
     // Move-command marker (reused every click): ring + center dot
@@ -698,6 +782,10 @@ fn spawn_hero(
             Health {
                 cur: HERO_HP,
                 max: HERO_HP,
+            },
+            Energy {
+                cur: ENERGY_MAX,
+                max: ENERGY_MAX,
             },
         ))
         .id();
@@ -899,6 +987,8 @@ fn spawn_health_bar(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     owner: Entity,
+    meter: Meter,
+    row: f32,
     width: f32,
     color: Color,
 ) {
@@ -926,7 +1016,7 @@ fn spawn_health_bar(
         ))
         .id();
     let bar = commands
-        .spawn((Transform::default(), Visibility::default(), HealthBar { owner }))
+        .spawn((Transform::default(), Visibility::default(), HealthBar { owner, meter, row }))
         .id();
     commands.entity(bar).add_child(bg);
     commands.entity(bar).add_child(fill);
@@ -934,9 +1024,17 @@ fn spawn_health_bar(
 
 // ───────────────────────────── Systems ─────────────────────────────
 
-fn quit_on_escape(keys: Res<ButtonInput<KeyCode>>, mut exit: EventWriter<AppExit>) {
+fn quit_on_escape(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut powers: ResMut<Powers>,
+    mut exit: EventWriter<AppExit>,
+) {
     if keys.just_pressed(KeyCode::Escape) {
-        exit.write(AppExit::Success);
+        if powers.targeting {
+            powers.targeting = false;
+        } else {
+            exit.write(AppExit::Success);
+        }
     }
 }
 
@@ -962,7 +1060,12 @@ fn issue_orders(
     mut hero: Query<&mut Hero>,
     enemies: Query<(Entity, &Transform), With<Enemy>>,
     mut marker: Query<(&mut MoveMarker, &mut Transform), Without<Enemy>>,
+    mut powers: ResMut<Powers>,
+    ui: Query<&Interaction>,
 ) {
+    if powers.targeting || ui.iter().any(|i| *i != Interaction::None) {
+        return;
+    }
     let just = buttons.just_pressed(MouseButton::Right) || buttons.just_pressed(MouseButton::Left);
     let held = buttons.pressed(MouseButton::Right);
     if !just && !held {
@@ -985,6 +1088,7 @@ fn issue_orders(
             best = Some((e, d, t.translation));
         }
     }
+    powers.active = None;
     let spot = match best {
         Some((e, _, pos)) => {
             hero.attack = Some(e);
@@ -1004,11 +1108,89 @@ fn issue_orders(
     }
 }
 
+// ───────────────────────────── Sound ─────────────────────────────
+// Sounds are synthesized at startup, so there are no audio files to ship.
+
+const SAMPLE_RATE: f32 = 44_100.0;
+
+fn make_wav(samples: &[f32]) -> Vec<u8> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
+    out.extend_from_slice(&(SAMPLE_RATE as u32 * 2).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes());
+    }
+    out
+}
+
+/// Your laser: a bright, clean "pew" with a fast downward pitch sweep.
+fn synth_player_laser() -> Vec<f32> {
+    let dur = 0.22;
+    let n = (dur * SAMPLE_RATE) as usize;
+    let mut phase = 0.0f32;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / SAMPLE_RATE;
+            let freq = 350.0 + 2400.0 * (-t * 14.0).exp();
+            phase += std::f32::consts::TAU * freq / SAMPLE_RATE;
+            let env = (1.0 - t / dur).powf(1.5) * (t / 0.002).min(1.0);
+            (phase.sin() + 0.35 * (phase * 2.0).sin()) * env * 0.45
+        })
+        .collect()
+}
+
+/// Enemy blaster: lower, buzzy and gritty, with a noisy crack at the start.
+fn synth_enemy_blaster() -> Vec<f32> {
+    let dur = 0.32;
+    let n = (dur * SAMPLE_RATE) as usize;
+    let mut phase = 0.0f32;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / SAMPLE_RATE;
+            let freq = 120.0 + 650.0 * (-t * 9.0).exp();
+            phase += std::f32::consts::TAU * freq / SAMPLE_RATE;
+            let square = if phase.sin() >= 0.0 { 1.0 } else { -1.0 };
+            let noise = hash(i as i32, 0, 5) * 2.0 - 1.0;
+            let env = (-t * 10.0).exp() * (t / 0.002).min(1.0);
+            (0.4 * square + 0.5 * phase.sin() + 0.5 * noise * (-t * 40.0).exp()) * env * 0.45
+        })
+        .collect()
+}
+
+fn play_sound(commands: &mut Commands, sound: &Handle<AudioSource>, volume: f32, speed: f32) {
+    commands.spawn((
+        AudioPlayer(sound.clone()),
+        PlaybackSettings::DESPAWN
+            .with_volume(Volume::Linear(volume))
+            .with_speed(speed),
+    ));
+}
+
 fn wrap_angle(a: f32) -> f32 {
     (a + PI).rem_euclid(2.0 * PI) - PI
 }
 
-fn spawn_bullet(commands: &mut Commands, fx: &Fx, pos: Vec3, dir: Vec3, speed: f32, damage: f32, from_player: bool) {
+fn spawn_bullet(
+    commands: &mut Commands,
+    fx: &Fx,
+    pos: Vec3,
+    dir: Vec3,
+    speed: f32,
+    damage: f32,
+    from_player: bool,
+    splash: f32,
+) {
     let mat = if from_player { &fx.player_bullet } else { &fx.enemy_bullet };
     commands.spawn((
         Mesh3d(fx.bullet.clone()),
@@ -1019,6 +1201,7 @@ fn spawn_bullet(commands: &mut Commands, fx: &Fx, pos: Vec3, dir: Vec3, speed: f
             life: 2.0,
             damage,
             from_player,
+            splash,
         },
         NotShadowCaster,
     ));
@@ -1040,6 +1223,7 @@ fn hero_combat(
     time: Res<Time>,
     mut commands: Commands,
     fx: Res<Fx>,
+    powers: Res<Powers>,
     mut hero: Query<(&Transform, &mut Hero)>,
     enemies: Query<(Entity, &Transform), (With<Enemy>, Without<Hero>)>,
 ) {
@@ -1048,6 +1232,13 @@ fn hero_combat(
     };
     h.cooldown = (h.cooldown - time.delta_secs()).max(0.0);
     h.aim = None;
+    if let Some(b) = &powers.active {
+        // Channeling the barrage: stand still and face the area.
+        h.aim = Some(b.center);
+        h.target = None;
+        h.attack = None;
+        return;
+    }
     if let Some(e) = h.attack {
         if enemies.get(e).is_err() {
             h.attack = None;
@@ -1084,8 +1275,10 @@ fn hero_combat(
     if wrap_angle(desired - h.yaw).abs() < 0.2 && h.cooldown <= 0.0 {
         let muzzle = pos + Quat::from_rotation_y(h.yaw) * Vec3::new(-0.03, 1.31, 1.4);
         let dir = (at + Vec3::Y * 1.0 - muzzle).normalize();
-        spawn_bullet(&mut commands, &fx, muzzle, dir, 45.0, HERO_DAMAGE, true);
+        spawn_bullet(&mut commands, &fx, muzzle, dir, 45.0, HERO_DAMAGE, true, 0.0);
         spawn_flash(&mut commands, &fx, &fx.muzzle, muzzle, 0.3, 0.06);
+        let pitch = 0.95 + hash((time.elapsed_secs() * 1000.0) as i32, 7, 3) * 0.12;
+        play_sound(&mut commands, &fx.player_shot, 0.5, pitch);
         h.cooldown = HERO_FIRE_INTERVAL;
     }
 }
@@ -1165,7 +1358,7 @@ fn enemy_spawner(
     };
     let pos = Vec3::new(x, height(x, z), z);
     let enemy = spawn_enemy(&mut commands, &mut meshes, &mut materials, pos, (-x).atan2(-z));
-    spawn_health_bar(&mut commands, &mut meshes, &mut materials, enemy, 1.2, Color::srgb(0.95, 0.2, 0.15));
+    spawn_health_bar(&mut commands, &mut meshes, &mut materials, enemy, Meter::Health, 0.0, 1.2, Color::srgb(0.95, 0.2, 0.15));
 }
 
 fn enemy_ai(
@@ -1222,8 +1415,11 @@ fn enemy_ai(
                     (hash(k, 3, 31) - 0.5) * 1.0,
                 );
             let d = (aim - muzzle).normalize();
-            spawn_bullet(&mut commands, &fx, muzzle, d, 26.0, ENEMY_DAMAGE, false);
+            spawn_bullet(&mut commands, &fx, muzzle, d, 26.0, ENEMY_DAMAGE, false, 0.0);
             spawn_flash(&mut commands, &fx, &fx.muzzle, muzzle, 0.25, 0.06);
+            // Quieter the farther away the shooter is.
+            let vol = (0.45 * (1.0 - dist / 30.0)).clamp(0.08, 0.45);
+            play_sound(&mut commands, &fx.enemy_shot, vol, 0.9 + hash(k, 5, 31) * 0.25);
             e.cooldown = ENEMY_FIRE_INTERVAL * (0.8 + hash(k, 4, 31) * 0.5);
         }
     }
@@ -1266,6 +1462,14 @@ fn projectiles(
         }
 
         let ground = next.y < height(next.x, next.z);
+        if ground && b.splash > 0.0 {
+            for (et, mut hp) in &mut enemies {
+                if (et.translation + Vec3::Y - next).length() < b.splash {
+                    hp.cur -= b.damage;
+                }
+            }
+            spawn_flash(&mut commands, &fx, &fx.boom, next, b.splash * 0.7, 0.18);
+        }
         if hit || ground {
             spawn_flash(&mut commands, &fx, &fx.hit, next, 0.35, 0.15);
             commands.entity(entity).despawn();
@@ -1293,9 +1497,10 @@ fn reap(
     mut commands: Commands,
     fx: Res<Fx>,
     enemies: Query<(Entity, &Transform, &Health), With<Enemy>>,
-    mut hero: Query<(&mut Transform, &mut Health, &mut Hero), Without<Enemy>>,
+    mut hero: Query<(&mut Transform, &mut Health, &mut Hero, &mut Energy), Without<Enemy>>,
+    mut powers: ResMut<Powers>,
 ) {
-    let hero_dead = hero.single().is_ok_and(|(_, hp, _)| hp.cur <= 0.0);
+    let hero_dead = hero.single().is_ok_and(|(_, hp, _, _)| hp.cur <= 0.0);
     for (e, tf, hp) in &enemies {
         if hp.cur <= 0.0 || hero_dead {
             spawn_flash(&mut commands, &fx, &fx.boom, tf.translation + Vec3::Y * 1.0, 1.4, 0.35);
@@ -1303,12 +1508,284 @@ fn reap(
         }
     }
     if hero_dead {
-        if let Ok((mut tf, mut hp, mut h)) = hero.single_mut() {
+        if let Ok((mut tf, mut hp, mut h, mut energy)) = hero.single_mut() {
             hp.cur = hp.max;
+            energy.cur = energy.max;
+            powers.active = None;
+            powers.cooldown = 0.0;
             tf.translation = Vec3::new(0.0, height(0.0, 0.0), 0.0);
             h.target = None;
             h.attack = None;
         }
+    }
+}
+
+fn spawn_hud(commands: &mut Commands) {
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(16.0),
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::Center,
+            column_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|bar| {
+            for i in 0..4 {
+                let mut slot = bar.spawn((
+                    Node {
+                        width: Val::Px(64.0),
+                        height: Val::Px(64.0),
+                        border: UiRect::all(Val::Px(2.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.07, 0.08, 0.11, 0.85)),
+                    BorderColor(Color::srgb(0.30, 0.34, 0.42)),
+                ));
+                let hotkey = Text::new((i + 1).to_string());
+                let hotkey_color = if i == 0 { Color::WHITE } else { Color::srgb(0.4, 0.4, 0.45) };
+                if i != 0 {
+                    slot.with_children(|s| {
+                        s.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                top: Val::Px(2.0),
+                                left: Val::Px(5.0),
+                                ..default()
+                            },
+                            hotkey,
+                            TextFont { font_size: 14.0, ..default() },
+                            TextColor(hotkey_color),
+                        ));
+                    });
+                    continue;
+                }
+                slot.insert((Button, AbilitySlot));
+                slot.with_children(|s| {
+                    // Icon: three bullets
+                    s.spawn(Node {
+                        column_gap: Val::Px(5.0),
+                        align_items: AlignItems::FlexEnd,
+                        ..default()
+                    })
+                    .with_children(|icon| {
+                        for h in [22.0, 34.0, 26.0] {
+                            icon.spawn((
+                                Node {
+                                    width: Val::Px(8.0),
+                                    height: Val::Px(h),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(1.0, 0.65, 0.15)),
+                            ));
+                        }
+                    });
+                    s.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            top: Val::Px(2.0),
+                            left: Val::Px(5.0),
+                            ..default()
+                        },
+                        hotkey,
+                        TextFont { font_size: 14.0, ..default() },
+                        TextColor(hotkey_color),
+                    ));
+                    s.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            bottom: Val::Px(2.0),
+                            right: Val::Px(5.0),
+                            ..default()
+                        },
+                        Text::new(format!("{}", BARRAGE_COST as i32)),
+                        TextFont { font_size: 14.0, ..default() },
+                        TextColor(Color::srgb(0.45, 0.7, 1.0)),
+                    ));
+                    s.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            bottom: Val::Px(0.0),
+                            left: Val::Px(0.0),
+                            width: Val::Percent(100.0),
+                            height: Val::Percent(0.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
+                        CooldownOverlay,
+                    ));
+                    s.spawn((
+                        Text::new(""),
+                        TextFont { font_size: 24.0, ..default() },
+                        TextColor(Color::WHITE),
+                        CooldownText,
+                    ));
+                });
+            }
+        });
+}
+
+/// Icon click / key 1 starts aiming; left-click on the ground casts, right-click or Esc cancels.
+fn ability_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<RtsCamera>>,
+    mut powers: ResMut<Powers>,
+    mut energy: Query<&mut Energy>,
+    slots: Query<&Interaction, (Changed<Interaction>, With<AbilitySlot>)>,
+    ui: Query<&Interaction>,
+) {
+    let Ok(mut energy) = energy.single_mut() else {
+        return;
+    };
+    let mut trigger = keys.just_pressed(KeyCode::Digit1);
+    if slots.iter().any(|i| *i == Interaction::Pressed) {
+        trigger = true;
+    }
+    if trigger {
+        if powers.targeting {
+            powers.targeting = false;
+        } else if powers.cooldown <= 0.0 && powers.active.is_none() && energy.cur >= BARRAGE_COST {
+            powers.targeting = true;
+        }
+        return;
+    }
+    if !powers.targeting {
+        return;
+    }
+    if buttons.just_pressed(MouseButton::Right) {
+        powers.targeting = false;
+    } else if buttons.just_pressed(MouseButton::Left) && !ui.iter().any(|i| *i != Interaction::None) {
+        let (Ok(window), Ok((cam, cam_tf))) = (windows.single(), camera.single()) else {
+            return;
+        };
+        if let Some(p) = cursor_ground(window, cam, cam_tf) {
+            energy.cur -= BARRAGE_COST;
+            powers.cooldown = BARRAGE_COOLDOWN;
+            powers.targeting = false;
+            powers.active = Some(Barrage {
+                center: p,
+                remaining: BARRAGE_TIME,
+                timer: 0.0,
+            });
+        }
+    }
+}
+
+/// Runs energy regen, the ability cooldown, and the barrage itself.
+fn barrage(
+    time: Res<Time>,
+    mut commands: Commands,
+    fx: Res<Fx>,
+    mut shots: Local<u32>,
+    mut powers: ResMut<Powers>,
+    mut energy: Query<&mut Energy>,
+    hero: Query<(&Transform, &Hero)>,
+) {
+    let dt = time.delta_secs();
+    if let Ok(mut e) = energy.single_mut() {
+        e.cur = (e.cur + ENERGY_REGEN * dt).min(e.max);
+    }
+    powers.cooldown = (powers.cooldown - dt).max(0.0);
+
+    let Ok((tf, h)) = hero.single() else {
+        return;
+    };
+    let Some(b) = powers.active.as_mut() else {
+        return;
+    };
+    b.remaining -= dt;
+    let center = b.center;
+    if b.remaining <= 0.0 {
+        powers.active = None;
+        return;
+    }
+    // Wait until we're turned toward the area before opening fire.
+    let desired = (center.x - tf.translation.x).atan2(center.z - tf.translation.z);
+    if wrap_angle(desired - h.yaw).abs() > 0.4 {
+        return;
+    }
+    b.timer -= dt;
+    let muzzle = tf.translation + Quat::from_rotation_y(h.yaw) * Vec3::new(-0.03, 1.31, 1.4);
+    while b.timer <= 0.0 {
+        b.timer += 1.0 / BARRAGE_RATE;
+        *shots += 1;
+        let k = *shots as i32;
+        let ang = hash(k, 1, 55) * std::f32::consts::TAU;
+        let r = BARRAGE_RADIUS * hash(k, 2, 55).sqrt();
+        let (x, z) = (center.x + ang.cos() * r, center.z + ang.sin() * r);
+        let aim = Vec3::new(x, height(x, z), z);
+        let dir = (aim - muzzle).normalize();
+        spawn_bullet(&mut commands, &fx, muzzle, dir, 40.0, BARRAGE_DAMAGE, true, BARRAGE_SPLASH);
+        spawn_flash(&mut commands, &fx, &fx.muzzle, muzzle, 0.3, 0.05);
+        play_sound(&mut commands, &fx.player_shot, 0.22, 1.1 + hash(k, 3, 55) * 0.25);
+    }
+}
+
+fn update_area_cursor(
+    powers: Res<Powers>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<RtsCamera>>,
+    mut ring: Query<(&mut Transform, &mut Visibility), With<AreaCursor>>,
+) {
+    let Ok((mut tf, mut vis)) = ring.single_mut() else {
+        return;
+    };
+    let pos = if let Some(b) = &powers.active {
+        Some(b.center)
+    } else if powers.targeting {
+        match (windows.single(), camera.single()) {
+            (Ok(w), Ok((c, g))) => cursor_ground(w, c, g),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    match pos {
+        Some(p) => {
+            tf.translation = p + Vec3::Y * 0.2;
+            *vis = Visibility::Inherited;
+        }
+        None => *vis = Visibility::Hidden,
+    }
+}
+
+fn update_hud(
+    powers: Res<Powers>,
+    energy: Query<&Energy>,
+    mut slots: Query<&mut BorderColor, With<AbilitySlot>>,
+    mut overlays: Query<&mut Node, With<CooldownOverlay>>,
+    mut texts: Query<&mut Text, With<CooldownText>>,
+) {
+    let enough = energy.single().is_ok_and(|e| e.cur >= BARRAGE_COST);
+    for mut border in &mut slots {
+        border.0 = if powers.targeting || powers.active.is_some() {
+            Color::srgb(1.0, 0.8, 0.2)
+        } else if powers.cooldown > 0.0 || !enough {
+            Color::srgb(0.30, 0.34, 0.42)
+        } else {
+            Color::srgb(0.5, 0.9, 1.0)
+        };
+    }
+    for mut node in &mut overlays {
+        let pct = if powers.cooldown > 0.0 {
+            powers.cooldown / BARRAGE_COOLDOWN * 100.0
+        } else if !enough {
+            100.0
+        } else {
+            0.0
+        };
+        node.height = Val::Percent(pct);
+    }
+    for mut text in &mut texts {
+        text.0 = if powers.cooldown > 0.0 {
+            format!("{}", powers.cooldown.ceil() as i32)
+        } else {
+            String::new()
+        };
     }
 }
 
@@ -1337,7 +1814,7 @@ fn animate_enemies(enemies: Query<&Enemy>, mut limbs: Query<(&ELimb, &mut Transf
 fn update_health_bars(
     mut commands: Commands,
     camera: Query<&Transform, (With<RtsCamera>, Without<HealthBar>, Without<HealthFill>)>,
-    owners: Query<(&Transform, &Health), (Without<HealthBar>, Without<HealthFill>)>,
+    owners: Query<(&Transform, Option<&Health>, Option<&Energy>), (Without<HealthBar>, Without<HealthFill>)>,
     mut bars: Query<(Entity, &HealthBar, &mut Transform, &Children)>,
     mut fills: Query<(&mut Transform, &HealthFill), Without<HealthBar>>,
 ) {
@@ -1349,13 +1826,17 @@ fn update_health_bars(
     let toward_cam = toward_cam.normalize_or_zero();
 
     for (entity, bar, mut tf, children) in &mut bars {
-        let Ok((owner_tf, hp)) = owners.get(bar.owner) else {
+        let Ok((owner_tf, hp, energy)) = owners.get(bar.owner) else {
             commands.entity(entity).despawn();
             continue;
         };
-        tf.translation = owner_tf.translation + toward_cam * 0.9 + Vec3::Y * 0.4;
+        tf.translation = owner_tf.translation + toward_cam * (0.9 + bar.row * 0.28) + Vec3::Y * 0.4;
         tf.rotation = cam.rotation;
-        let frac = (hp.cur / hp.max).clamp(0.0, 1.0);
+        let frac = match bar.meter {
+            Meter::Health => hp.map_or(0.0, |h| h.cur / h.max),
+            Meter::Energy => energy.map_or(0.0, |e| e.cur / e.max),
+        }
+        .clamp(0.0, 1.0);
         for child in children.iter() {
             if let Ok((mut ftf, fill)) = fills.get_mut(child) {
                 ftf.scale.x = frac.max(0.001);
